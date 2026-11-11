@@ -1,4 +1,5 @@
 #include "cado.h" // IWYU pragma: keep
+#include <cstdlib>
 
 #include <cerrno>
 #include <cstdio>
@@ -191,9 +192,11 @@ FILE * fopen_maybe_compressed2(char const * orig_name, char const * mode,
         }
 
         if (strchr(mode, 'r') && *r.pfmt_in)
-            command = fmt::format(fmt::runtime(r.pfmt_in), name);
+            command = fmt::format(fmt::runtime(
+                        cado::details::compression_command(r, false)), name);
         else if (strchr(mode, 'w') && *r.pfmt_out)
-            command = fmt::format(fmt::runtime(r.pfmt_out), name);
+            command = fmt::format(fmt::runtime(
+                        cado::details::compression_command(r, true)), name);
 
         if (!command.empty()) {
             /* apparently popen() under Linux does not accept the 'b' modifier
@@ -322,3 +325,31 @@ std::string get_suffix(std::string const & filename, std::string const & def)
     return def;
 }
 
+
+static bool have_pigz()
+{
+    static bool const yes = []() {
+        char const * e = getenv("CADO_NO_PIGZ");
+        if (e && atoi(e)) return false;
+        char const * path = getenv("PATH");
+        if (!path) return false;
+        std::string const P = path;
+        for (size_t a = 0; a <= P.size(); ) {
+            size_t b = P.find(':', a);
+            if (b == std::string::npos) b = P.size();
+            std::string const dir = P.substr(a, b - a);
+            if (!dir.empty() && access((dir + "/pigz").c_str(), X_OK) == 0)
+                return true;
+            a = b + 1;
+        }
+        return false;
+    }();
+    return yes;
+}
+
+char const * cado::details::compression_command(suffix_handler const & r, bool write)
+{
+    if (strcmp(r.suffix, ".gz") == 0 && have_pigz())
+        return write ? "pigz -c --fast > {}" : "pigz -dc {}";
+    return write ? r.pfmt_out : r.pfmt_in;
+}

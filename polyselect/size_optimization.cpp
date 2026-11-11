@@ -17,6 +17,7 @@
 #include "gcd.h"
 #include "lll.h"
 #include "size_optimization.hpp"
+#include "sopt_gpu.hpp"
 #include "double_poly.h"
 #include "polyselect_norms.hpp"
 #include "utils_cxx.hpp"
@@ -568,75 +569,22 @@ mpz_poly_fprintf_verbose (FILE *out, cxx_mpz_poly const & f, int verbose)
    XXX: Could we replace lognorm computation by norm computation to save
         computation of the log. Compute lognorm only for printing.
 */
-double
-sopt_local_descent (cxx_mpz_poly & f_opt, cxx_mpz_poly & g_opt,
-                    cxx_mpz_poly const & f_raw, cxx_mpz_poly const & g_raw,
-                    int use_translation, int deg_rotation,
-                    unsigned int max_iter, int verbose)
+/* The main loop of sopt_local_descent, from a state: f_opt, g_opt,
+   logmu_opt = L2_skew_lognorm (f_opt), the steps kt and k[], and the
+   number of iterations done. */
+static double
+sopt_local_descent_loop (cxx_mpz_poly & f_opt, cxx_mpz_poly & g_opt,
+                         double logmu_opt, mpz_t kt, mpz_t * k,
+                         int use_translation, int deg_rotation,
+                         unsigned int iter, unsigned int max_iter, int verbose)
 {
-  mpz_t kt, k[SOPT_MAX_DEGREE_ROTATION+1]; /* current offset */
   mpz_t tmp;
   int changedt, changed[SOPT_MAX_DEGREE_ROTATION+1];
-  double logmu_opt, logmu;
-  unsigned int iter = 0;
+  double logmu;
   mpz_poly ftmp;
 
-  ASSERT_ALWAYS(deg_rotation <= SOPT_MAX_DEGREE_ROTATION);
-
-  logmu_opt = L2_skew_lognorm (f_raw);
   mpz_init (tmp);
-  mpz_poly_init (ftmp, f_raw->deg);
-
-  if (verbose > 2)
-  {
-    fprintf (stderr, "# sopt:       starting local descent with polynomials:\n"
-                     "# sopt:       f_raw = ");
-    mpz_poly_fprintf_verbose (stderr, f_raw, verbose);
-    fprintf (stderr, "# sopt:       g_raw = ");
-    mpz_poly_fprintf_verbose (stderr, g_raw, verbose);
-    fprintf (stderr, "# sopt:       with lognorm = %f\n", logmu_opt);
-  }
-
-  /* initialize k[i] to the smallest power of two that increases the lognorm
-     by SOPT_LOCAL_DESCENT_GUARD with respect to the initial polynomial, to
-     avoid being stuck in a very flat region */
-  for (int i = 0; i <= deg_rotation; i++)
-  {
-    mpz_init_set_ui (k[i], 1);
-    for(;;) {
-      mpz_poly_rotation (ftmp, f_raw, g_raw, k[i], i);
-      logmu = L2_skew_lognorm (ftmp);
-      if (logmu > logmu_opt + SOPT_LOCAL_DESCENT_GUARD)
-      {
-        mpz_neg (tmp, k[i]);
-        mpz_poly_rotation (ftmp, f_raw, g_raw, tmp, i);
-        logmu = L2_skew_lognorm (ftmp);
-        if (logmu > logmu_opt + SOPT_LOCAL_DESCENT_GUARD)
-          break;
-      }
-    mpz_mul_2exp (k[i], k[i], 1);
-    }
-  }
-
-  /* initialize kt likewise */
-  mpz_init_set_ui (kt, 1);
-  for(;;)
-  {
-    mpz_poly_translation (ftmp, f_raw, kt);
-    logmu = L2_skew_lognorm (ftmp);
-    if (logmu > logmu_opt + SOPT_LOCAL_DESCENT_GUARD)
-    {
-      mpz_neg (tmp, kt);
-      mpz_poly_translation (ftmp, f_raw, tmp);
-      logmu = L2_skew_lognorm (ftmp);
-      if (logmu > logmu_opt + SOPT_LOCAL_DESCENT_GUARD)
-        break;
-    }
-    mpz_mul_2exp (kt, kt, 1);
-  }
-
-  mpz_poly_set (f_opt, f_raw);
-  mpz_poly_set (g_opt, g_raw);
+  mpz_poly_init (ftmp, f_opt->deg);
 
   /* abort in cases where the descent procedure takes too long to converge;
    * 300 iterations seems largely enough in most cases */
@@ -730,6 +678,112 @@ sopt_local_descent (cxx_mpz_poly & f_opt, cxx_mpz_poly & g_opt,
     mpz_poly_fprintf_verbose (stderr, g_opt, verbose);
     fprintf (stderr, "# sopt:       with lognorm = %f\n", logmu_opt);
   }
+
+  mpz_clear (tmp);
+  mpz_poly_clear (ftmp);
+  return logmu_opt;
+}
+
+/* sopt_local_descent, from the state at the beginning of an iteration
+   (as the GPU leaves it): the steps are kt = 2^kt_exp and k[i] =
+   2^k_exp[i], and iter iterations are done. */
+double
+sopt_local_descent_continue (cxx_mpz_poly & f_opt, cxx_mpz_poly & g_opt,
+                             int kt_exp, int const * k_exp, unsigned int iter,
+                             int use_translation, int deg_rotation,
+                             unsigned int max_iter, int verbose)
+{
+  mpz_t kt, k[SOPT_MAX_DEGREE_ROTATION+1];
+  ASSERT_ALWAYS(deg_rotation <= SOPT_MAX_DEGREE_ROTATION);
+  mpz_init (kt);
+  mpz_ui_pow_ui (kt, 2, kt_exp);
+  for (int i = 0; i <= deg_rotation; i++) {
+    mpz_init (k[i]);
+    mpz_ui_pow_ui (k[i], 2, k_exp[i]);
+  }
+  const double logmu_opt = L2_skew_lognorm (f_opt);
+  const double r = sopt_local_descent_loop (f_opt, g_opt, logmu_opt, kt, k,
+                                            use_translation, deg_rotation,
+                                            iter, max_iter, verbose);
+  for (int i = 0; i <= deg_rotation; i++)
+    mpz_clear (k[i]);
+  mpz_clear (kt);
+  return r;
+}
+
+double
+sopt_local_descent (cxx_mpz_poly & f_opt, cxx_mpz_poly & g_opt,
+                    cxx_mpz_poly const & f_raw, cxx_mpz_poly const & g_raw,
+                    int use_translation, int deg_rotation,
+                    unsigned int max_iter, int verbose)
+{
+  mpz_t kt, k[SOPT_MAX_DEGREE_ROTATION+1]; /* current offset */
+  mpz_t tmp;
+  /* the main loop: sopt_local_descent_loop */
+  double logmu_opt, logmu;
+  unsigned int iter = 0;
+  mpz_poly ftmp;
+
+  ASSERT_ALWAYS(deg_rotation <= SOPT_MAX_DEGREE_ROTATION);
+
+  logmu_opt = L2_skew_lognorm (f_raw);
+  mpz_init (tmp);
+  mpz_poly_init (ftmp, f_raw->deg);
+
+  if (verbose > 2)
+  {
+    fprintf (stderr, "# sopt:       starting local descent with polynomials:\n"
+                     "# sopt:       f_raw = ");
+    mpz_poly_fprintf_verbose (stderr, f_raw, verbose);
+    fprintf (stderr, "# sopt:       g_raw = ");
+    mpz_poly_fprintf_verbose (stderr, g_raw, verbose);
+    fprintf (stderr, "# sopt:       with lognorm = %f\n", logmu_opt);
+  }
+
+  /* initialize k[i] to the smallest power of two that increases the lognorm
+     by SOPT_LOCAL_DESCENT_GUARD with respect to the initial polynomial, to
+     avoid being stuck in a very flat region */
+  for (int i = 0; i <= deg_rotation; i++)
+  {
+    mpz_init_set_ui (k[i], 1);
+    for(;;) {
+      mpz_poly_rotation (ftmp, f_raw, g_raw, k[i], i);
+      logmu = L2_skew_lognorm (ftmp);
+      if (logmu > logmu_opt + SOPT_LOCAL_DESCENT_GUARD)
+      {
+        mpz_neg (tmp, k[i]);
+        mpz_poly_rotation (ftmp, f_raw, g_raw, tmp, i);
+        logmu = L2_skew_lognorm (ftmp);
+        if (logmu > logmu_opt + SOPT_LOCAL_DESCENT_GUARD)
+          break;
+      }
+    mpz_mul_2exp (k[i], k[i], 1);
+    }
+  }
+
+  /* initialize kt likewise */
+  mpz_init_set_ui (kt, 1);
+  for(;;)
+  {
+    mpz_poly_translation (ftmp, f_raw, kt);
+    logmu = L2_skew_lognorm (ftmp);
+    if (logmu > logmu_opt + SOPT_LOCAL_DESCENT_GUARD)
+    {
+      mpz_neg (tmp, kt);
+      mpz_poly_translation (ftmp, f_raw, tmp);
+      logmu = L2_skew_lognorm (ftmp);
+      if (logmu > logmu_opt + SOPT_LOCAL_DESCENT_GUARD)
+        break;
+    }
+    mpz_mul_2exp (kt, kt, 1);
+  }
+
+  mpz_poly_set (f_opt, f_raw);
+  mpz_poly_set (g_opt, g_raw);
+
+  logmu_opt = sopt_local_descent_loop (f_opt, g_opt, logmu_opt, kt, k,
+                                       use_translation, deg_rotation,
+                                       iter, max_iter, verbose);
 
   for (int i = 0; i <= deg_rotation; i++)
     mpz_clear (k[i]);
@@ -1070,4 +1124,144 @@ size_optimization (cxx_mpz_poly & f_opt, cxx_mpz_poly & g_opt,
   /* rotation up to degree d-2 */
   return size_optimization_aux (f_opt, g_opt, f_raw, g_raw,
                                 sopt_effort, verbose, d - 2);
+}
+
+/* size_optimization_aux, for several pairs (max_rot = d - 2, as
+ * size_optimization), in three passes: the translations to try and
+ * best_norm2 for each pair (as in size_optimization_aux's loop, in the
+ * same order, with the same check for translations already seen), the
+ * local descents of all of them together (sopt_gpu_descents, or the CPU),
+ * then the comparisons, in the same order. Each step only depends on its
+ * own inputs, so the results are size_optimization's. Verbose output
+ * (verbose > 1) is that of size_optimization, which is used then. */
+void
+size_optimization_batch (std::vector<sopt_batch_item> & items,
+                         const unsigned int sopt_effort, const int verbose)
+{
+  if (verbose > 1 || !sopt_gpu_enabled ()) {
+    for (auto & it : items)
+      it.lognorm = size_optimization (it.f_opt, it.g_opt, it.f_raw, it.g_raw,
+                                      sopt_effort, verbose);
+    return;
+  }
+
+  struct prepared {
+    double best_lognorm;
+    size_t first, count;        /* its starts in the arrays below */
+  };
+  std::vector<prepared> P (items.size ());
+  /* descent starts, for each degree */
+  std::vector<cxx_mpz_poly> sf, sg;
+  std::vector<double> slognorm;
+
+  for (size_t j = 0; j < items.size (); j++) {
+    cxx_mpz_poly const & f_raw = items[j].f_raw;
+    cxx_mpz_poly const & g_raw = items[j].g_raw;
+    ASSERT_ALWAYS (f_raw->deg >= 2);
+    ASSERT_ALWAYS (g_raw->deg == 1);
+    const int d = f_raw->deg;
+    const int max_rot = d - 2;
+    double best_lognorm = L2_skew_lognorm (f_raw);
+    best_lognorm += expected_rotation_gain (f_raw, g_raw);
+
+    cxx_mpz tmp, skew;
+    cxx_mpz_poly ft, gt;
+    std::vector<cxx_mpz> list_k;
+    list_k.reserve (SOPT_INIT_SIZE_ALLOCATED_TRANSLATIONS);
+    if (d == 6 || d == 5) {
+      if (d == 6)
+        sopt_find_translations_deg6 (list_k, f_raw, g_raw, verbose, sopt_effort);
+      else
+        sopt_find_translations_deg5 (list_k, f_raw, g_raw, verbose, sopt_effort);
+      mpz_set_ui (tmp, 0);
+      list_k.push_back (tmp);
+      std::ranges::sort (list_k);
+      auto it = list_k.begin ();
+      for (auto jt = it ; jt != list_k.end () ; ) {
+        *it = *jt++;
+        for ( ; jt != list_k.end () && *jt == *it ; jt++)
+          ;
+        it++;
+      }
+      /* as in size_optimization_aux: the list keeps its length, the
+         entries past it are leftovers */
+    } else {
+      mpz_set_ui (tmp, 0);
+      list_k.push_back (tmp);
+    }
+    sopt_get_skewness (skew, f_raw, g_raw);
+
+    P[j].best_lognorm = best_lognorm;
+    P[j].first = sf.size ();
+    std::vector<cxx_mpz> list_k_opt;
+    list_k_opt.reserve (list_k.size ());
+    for (auto ki : list_k) {
+      best_norm2 (ft, gt, f_raw, g_raw, skew, ki, max_rot, DBL_MAX);
+      if (std::ranges::find (list_k_opt, ki) != list_k_opt.end ())
+        continue;
+      list_k_opt.push_back (ki);
+      sf.push_back (ft);
+      sg.push_back (gt);
+    }
+    P[j].count = sf.size () - P[j].first;
+  }
+
+  /* the descents: use_translation = 1, deg_rotation = d - 2 */
+  slognorm.assign (sf.size (), 0);
+  {
+    /* by degree (all the same, in practice) */
+    std::vector<int> degs;
+    for (auto const & f : sf)
+      if (std::ranges::find (degs, f->deg) == degs.end ())
+        degs.push_back (f->deg);
+    for (int d : degs) {
+      std::vector<size_t> idx;
+      std::vector<cxx_mpz_poly> F, G;
+      for (size_t i = 0; i < sf.size (); i++)
+        if (sf[i]->deg == d) {
+          idx.push_back (i);
+          F.push_back (sf[i]);
+          G.push_back (sg[i]);
+        }
+      std::vector<double> L;
+      if (!sopt_gpu_descents (F, G, d - 2, SOPT_DEFAULT_MAX_STEPS, L)) {
+        L.resize (F.size ());
+        for (size_t i = 0; i < F.size (); i++) {
+          cxx_mpz_poly fo, go;
+          L[i] = sopt_local_descent (fo, go, F[i], G[i], 1, d - 2,
+                                     SOPT_DEFAULT_MAX_STEPS, verbose);
+          F[i] = fo;
+          G[i] = go;
+        }
+      }
+      for (size_t i = 0; i < idx.size (); i++) {
+        sf[idx[i]] = F[i];
+        sg[idx[i]] = G[i];
+        slognorm[idx[i]] = L[i];
+      }
+    }
+  }
+
+  for (size_t j = 0; j < items.size (); j++) {
+    double best_lognorm = P[j].best_lognorm;
+    cxx_mpz_poly fbest = items[j].f_raw, gbest = items[j].g_raw;
+    for (size_t i = P[j].first; i < P[j].first + P[j].count; i++) {
+      double lognorm = slognorm[i];
+      lognorm += expected_rotation_gain (sf[i], sg[i]);
+#ifdef POLYSELECT_CLASSICAL
+      if (lognorm < best_lognorm &&
+          mpz_cmpabs (sf[i]->coeff[sf[i]->deg], items[j].f_raw->coeff[sf[i]->deg]) == 0)
+#else
+      if (lognorm < best_lognorm)
+#endif
+      {
+        best_lognorm = lognorm;
+        mpz_poly_swap (fbest, sf[i]);
+        mpz_poly_swap (gbest, sg[i]);
+      }
+    }
+    items[j].f_opt = fbest;
+    items[j].g_opt = gbest;
+    items[j].lognorm = best_lognorm;
+  }
 }

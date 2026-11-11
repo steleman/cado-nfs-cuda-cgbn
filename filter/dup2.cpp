@@ -245,6 +245,9 @@ struct dup2_process { /* {{{ */
          */
         pl.parse("dl", is_for_dl);
         pl.parse("large-ab", largeab);
+        pl.parse("t", nthreads_for_roots);
+        if (nthreads_for_roots < 1)
+            nthreads_for_roots = 1;
 
     }
 
@@ -254,6 +257,7 @@ struct dup2_process { /* {{{ */
         pl.declare_usage("nrels", "number of expected relations");
         pl.declare_usage("dl", "do not reduce exponents modulo 2");
         pl.declare_usage("large-ab", "enable support for a and b beyond 64 bits");
+        pl.declare_usage("t", "threads computing roots mod p (default 3)");
     }
 
     static void configure_switches(cxx_param_list & pl) {

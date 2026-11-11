@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include <algorithm>
 #include <array>
@@ -45,6 +46,15 @@
 #include "las-auxiliary-data.hpp"
 #include "las-bkmult.hpp"
 #include "las-choose-sieve-area.hpp"
+#ifdef HAVE_CUDA
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#include "ecm/facul-gpu-kernels.h"
+#endif
+#include "las-cofac-gpu.hpp"
+#include "las-fill-gpu.hpp"
+#include "las-sieve-gpu.hpp"
 #include "las-cofactor.hpp"
 #include "las-config.hpp"
 #include "las-divide-primes.hpp"
@@ -813,7 +823,10 @@ static void per_special_q_banner(special_q const & doing)
  * downsort, apply-buckets, lognorm computation, small sieve computation,
  * and survivor search and detection, all from here.
  */
-static void do_one_special_q_sublat(nfs_work & ws, std::shared_ptr<nfs_work_cofac> const & wc_p, std::shared_ptr<nfs_aux> const & aux_p, ALGO::special_q_data const & Q, thread_pool & pool)/*{{{*/
+/* defer: if not NULL and the GPU siever sieves this special-q, its
+ * cofactoring tasks are queued in a new task group returned there, and
+ * not waited for (see las_subjob) */
+static void do_one_special_q_sublat(nfs_work & ws, std::shared_ptr<nfs_work_cofac> const & wc_p, std::shared_ptr<nfs_aux> const & aux_p, ALGO::special_q_data const & Q, thread_pool & pool, std::shared_ptr<task_group> * defer MAYBE_UNUSED)/*{{{*/
 {
     int const nsides = ws.sides.size();
 
@@ -832,6 +845,50 @@ static void do_one_special_q_sublat(nfs_work & ws, std::shared_ptr<nfs_work_cofa
     }
 
     where_am_I::begin_special_q(ws, Q);
+
+#ifndef SIQS_SIEVE
+    /* the GPU siever (las-sieve-gpu.hpp): the small sieve data, then the
+     * whole region on the GPU, then the survivors as usual */
+    if (las_sieve_gpu_enabled(ws, Q)) {
+        {
+            SIBLING_TIMER(timer_special_q, "prepare small sieve");
+            for (int side = 0; side < nsides; side++) {
+                nfs_work::side_data & wss(ws.sides[side]);
+                wss.ssd->small_sieve_init(
+                        wss.fbs->small_sieve_entries.resieved,
+                        wss.fbs->small_sieve_entries.rest,
+                        ws.conf.logI,
+                        side,
+                        wss.fbK,
+                        Q,
+                        wss.lognorms.scale);
+            }
+        }
+        auto regions = std::make_shared<std::vector<gpu_sieve_region>>();
+        bool ok;
+        {
+            SIBLING_TIMER(timer_special_q, "GPU siever");
+            ok = las_sieve_gpu_sieve(ws, Q, *regions, wc_p.get());
+        }
+        if (ok) {
+            CHILD_TIMER(timer_special_q, "process_bucket_region outer container");
+            TIMER_CATEGORY(timer_special_q, sieving_mixed());
+            if (defer && !sync_at_special_q) {
+                if (*defer)
+                    (*defer)->wait();
+                *defer = std::make_shared<task_group>();
+                process_gpu_regions(ws, wc_p, aux_p, Q, pool, w, regions, defer->get());
+                return;
+            }
+            process_gpu_regions(ws, wc_p, aux_p, Q, pool, w, regions);
+            if (sync_at_special_q)
+                pool.drain_all_queues();
+            else
+                pool.drain_queue(thread_pool::QUEUE_GENERIC);
+            return;
+        }
+    }
+#endif
 
     /* TODO: is there a way to share this in sublat mode ? */
 
@@ -907,6 +964,10 @@ static void do_one_special_q_sublat(nfs_work & ws, std::shared_ptr<nfs_work_cofa
             sss_tg.wait();
         }
 
+#ifndef SIQS_SIEVE
+        las_sieve_gpu_run(ws, Q);
+#endif
+
 
         pool.drain_queue(thread_pool::QUEUE_GENERIC);
 
@@ -943,7 +1004,8 @@ do_one_special_q(
         las_info & las,
         nfs_work & ws,
         std::shared_ptr<nfs_aux> const & aux_p,
-        thread_pool & pool)/*{{{*/
+        thread_pool & pool,
+        std::shared_ptr<task_group> * defer)/*{{{*/
 {
     nfs_aux & aux(*aux_p);
 
@@ -1023,7 +1085,7 @@ do_one_special_q(
         if (Q.sublat.m > 1)
             verbose_fmt_print(0, 1, "{}\n",
                     cado::special_markers::begin_sublattice { Q.sublat });
-        do_one_special_q_sublat(ws, wc_p, aux_p, Q, pool);
+        do_one_special_q_sublat(ws, wc_p, aux_p, Q, pool, defer);
     }
 
     /* It's better than before, but still. We're going to keep this data
@@ -1155,6 +1217,33 @@ static void transfer_local_cofac_candidates_to_global(las_info & las, nfs_work &
 }
 
 
+#ifdef HAVE_CUDA
+#include "gpu_claim.h"
+/* The GPU of this las, decided once at start and put in
+ * CADO_LAS_GPU_DEVICE, which every GPU part of las (siever, bucket fill,
+ * cofactorization) reads first, so that they all use the same GPU:
+ * CADO_LAS_GPU_DEVICE if given, else an MPI / Slurm local rank, else a
+ * GPU claimed through utils/gpu_claim.cpp (lock files in
+ * $TMPDIR/cado-gpu-<uid>: the las of a node take the GPUs in turn; with
+ * several GPUs, cado-nfs.py runs one sieving workunit per GPU). Before,
+ * a separate lock (/tmp/cado-las-gpu-<uid>-<dev>.lock) did this on
+ * multi-GPU nodes only, and the parts read the ranks differently. */
+static void choose_gpu_device()
+{
+    if (getenv("CADO_LAS_GPU_DEVICE"))
+        return;
+    int const n = fgpu_device_count();
+    if (n <= 0) return;
+    const char * lr = getenv("OMPI_COMM_WORLD_LOCAL_RANK");
+    if (!lr) lr = getenv("MPI_LOCALRANKID");
+    if (!lr) lr = getenv("SLURM_LOCALID");
+    int const d = (lr ? atoi(lr) : cado_gpu_claim("las", n)) % n;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%d", d);
+    setenv("CADO_LAS_GPU_DEVICE", buf, 1);
+}
+#endif
+
 static void las_subjob(las_info & las, int subjob, report_and_timer & global_rt)/*{{{*/
 {
     where_am_I w MAYBE_UNUSED;
@@ -1171,6 +1260,9 @@ static void las_subjob(las_info & las, int subjob, report_and_timer & global_rt)
         /* add scoping to control dtor call */
         thread_pool pool(las.number_of_threads_per_subjob(), cumulated_wait_time, thread_pool::NQUEUES, sync_thread_pool);
         auto dummy = call_dtor([&](){
+            /* the GPU batch must hand back this pool's candidates first */
+            if (las_cofac_gpu * G = las_cofac_gpu::get())
+                G->flush(pool);
             /* we can't collect traces of running threads, of course!! */
             pool.drain_all_queues();
             /* subjobs run concurrently and all merge into the same
@@ -1178,7 +1270,29 @@ static void las_subjob(las_info & las, int subjob, report_and_timer & global_rt)
             const std::lock_guard<std::mutex> lock(las.chronogram_map_mtx);
             pool.collect_traces(las.chronogram_map, las.number_of_threads_per_subjob() * subjob);
         });
-        nfs_work ws(las, ALGO{});
+        /* With the GPU siever, a subjob's main thread waits on the GPU
+         * while its pool threads are idle, and then the pool cofactors
+         * while the GPU is idle. So the cofactoring tasks of a
+         * special-q sieved on the GPU are not waited for: the next
+         * special-q is sieved meanwhile, in the other nfs_work (the
+         * tasks read theirs), and a nfs_work is reused only once its
+         * tasks are done. Not for the descent (which needs each
+         * special-q's result before the next), batch cofactoring, -sync
+         * or -exit-early; CADO_LAS_GPU_OVERLAP=0 turns it off. */
+        bool const overlap = !las.batch && !las.batch_print_survivors.filename
+            && !sync_at_special_q && !exit_after_rel_found
+            && dynamic_cast<special_q_task_collection_simple *>(las.tree.get())
+            && [] { char const * e = getenv("CADO_LAS_GPU_OVERLAP");
+                    return !e || strcmp(e, "0") != 0; }();
+        std::unique_ptr<nfs_work> ws_slots[2];
+        ws_slots[0] = std::make_unique<nfs_work>(las, ALGO{});
+        std::shared_ptr<task_group> pending[2];
+        int slot = 0;
+        /* on every way out, before ws_slots go */
+        auto const wait_pending = call_dtor([&]() {
+            for (auto & p : pending)
+                if (p) { p->wait(); p.reset(); }
+        });
 
         /* {{{ Doc on todo list handling
          * todo_list_base::feed_and_pop() behaves in different
@@ -1222,6 +1336,14 @@ static void las_subjob(las_info & las, int subjob, report_and_timer & global_rt)
              */
             auto rel_hash_p = std::make_shared<nfs_aux::rel_hash_t>();
 
+            if (!ws_slots[slot])
+                ws_slots[slot] = std::make_unique<nfs_work>(las, ALGO{});
+            if (pending[slot]) {
+                pending[slot]->wait();
+                pending[slot].reset();
+            }
+            nfs_work & ws(*ws_slots[slot]);
+
             for(;;) {
                 /*
                  * The lifetime of the nfs_aux object *is* thread-safe,
@@ -1256,7 +1378,8 @@ static void las_subjob(las_info & las, int subjob, report_and_timer & global_rt)
 
                     prepare_timer_layout_for_multithreaded_tasks(timer_special_q, las.cpoly.nsides());
 
-                    bool const done = do_one_special_q(las, ws, aux_p, pool);
+                    bool const done = do_one_special_q(las, ws, aux_p, pool,
+                            overlap ? &pending[slot] : nullptr);
 
                     if (!done) {
                         /* Then we don't even keep track of the time, it's
@@ -1365,6 +1488,10 @@ static void las_subjob(las_info & las, int subjob, report_and_timer & global_rt)
                 }
                 break;
             }
+
+            /* this nfs_work is busy: the next special-q takes the other */
+            if (pending[slot])
+                slot ^= 1;
 
         } // end of loop over special q ideals.
 
@@ -1483,6 +1610,10 @@ static int las_main (int argc0, char const * argv0[])/*{{{*/
 
     cxx_param_list pl;
     cado_sighandlers_install();
+
+#ifdef HAVE_CUDA
+    choose_gpu_device();
+#endif
 
     configure(pl);
 
@@ -1933,6 +2064,10 @@ static int las_main (int argc0, char const * argv0[])/*{{{*/
     if (main_output->verbose >= 1 && las.config_pool.default_config_ptr) {
         expected_memory_usage(las.config_pool.base, las, true, base_memory);
     }
+    las_cofac_gpu::report();
+    las_fill_gpu_report();
+    las_sieve_gpu_report();
+
     const size_t peakmem = PeakMemusage();
     if (peakmem > 0)
         verbose_fmt_print (2, 1, "# PeakMemusage (MB) = {}\n",

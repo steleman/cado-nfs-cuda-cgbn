@@ -56,6 +56,12 @@ struct cofac_standalone {
     bool ab_coprime() const;
     void print_as_survivor(FILE * f);
     relation get_relation(special_q const & doing) const;
+    /* Append the text of get_relation(doing) (as operator<< prints it,
+     * without newline) to out, without building the relation: no mpz
+     * per prime. Returns false, leaving out unchanged, when this does
+     * not apply (a value above 64 bits, not two sides); then use
+     * get_relation. */
+    bool format_relation(special_q const & doing, std::string & out) const;
     void transfer_to_cofac_list(lock_guarded_container<std::list<cofac_candidate>> & L);
     int factor_leftover_norms(nfs_work_cofac & wc);
     friend std::ostream& operator<<(

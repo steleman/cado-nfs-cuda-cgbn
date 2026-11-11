@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 #include <gmp.h>
 
@@ -23,6 +24,8 @@
 #include "size_optimization.hpp"
 #include "timing.h"             // for milliseconds
 #include "utils_cxx.hpp"
+#include "ropt_gpu.hpp"
+#include "cxx_mpz.hpp"
 
 //#define TIMING_ROPT_STAGE2
 /**
@@ -60,6 +63,16 @@ print_sievearray ( double **A,
 #endif
 
 
+/* the value a sieve array starts with */
+static inline int16_t
+sievearray_init_value ()
+{
+  /* sage: sum ([p/(p^2-1)*log(p) for p in prime_range(200)])
+     4.2774597204802731 */
+  float tmpf = SUP_ALPHA;
+  return (int16_t) ceil (tmpf * 1000.0);
+}
+
 /**
  * Init the sieve array.
  */
@@ -68,15 +81,13 @@ sievearray_init ( sievearray_t sievearray,
                   unsigned int i,
                   unsigned int j )
 {
-  /* sage: sum ([p/(p^2-1)*log(p) for p in prime_range(200)])
-     4.2774597204802731 */
-  float tmpf = SUP_ALPHA;
-  int16_t tmpu = (int16_t) ceil (tmpf * 1000.0);
+  int16_t tmpu = sievearray_init_value ();
   unsigned long len = i * j, k;
 
   /* allocate matrix A. */
   sievearray->len_i = i;
   sievearray->len_j = j;
+  sievearray->ops = NULL;
   sievearray->array = (int16_t *) malloc ( len * sizeof (int16_t) );
 
   if ( sievearray->array != NULL ) {
@@ -95,8 +106,7 @@ sievearray_init ( sievearray_t sievearray,
 static inline void
 sievearray_reset ( sievearray_t sievearray )
 {
-  float tmpf = SUP_ALPHA;
-  int16_t tmpu = (int16_t) ceil (tmpf * 1000.0);
+  int16_t tmpu = sievearray_init_value ();
   unsigned long k, len = sievearray->len_i * sievearray->len_j;
 
   if (sievearray->array != NULL) {
@@ -123,7 +133,7 @@ sievearray_free ( sievearray_t sievearray )
  * Root sieve on ARRAY along the j-line.
  */
 static inline long
-rootsieve_run_line ( int16_t *sa,
+rootsieve_run_line ( sievearray_s * sav,
                      long j_bound,
                      long j,
                      unsigned int pe,
@@ -131,6 +141,16 @@ rootsieve_run_line ( int16_t *sa,
 {
   long pel = (long) pe;
 
+  if (sav->ops) {
+    /* the same line, recorded; the return value is the j at which the
+       loop below would stop */
+    if (j > j_bound)
+      return j;
+    ropt_sieve_oplist_add (sav->ops, j, j_bound, pe, sub);
+    return j + ((j_bound - j) / pel + 1) * pel;
+  }
+
+  int16_t * sa = sav->array;
   /* bounding j with B0 < tmp + p*j < B1 */
   while ( j <= j_bound ) {
     sa[j] = sa[j] - sub;
@@ -406,7 +426,7 @@ rootsieve_run_multroot_lift ( node *currnode,
         long old_j = j_idx;
         while (i_idx < (long) sa->len_i) {
           j_idx = old_j;
-          rootsieve_run_line ( sa->array,
+          rootsieve_run_line ( sa,
                                i_idx * sa->len_j + sa->len_j - 1,
                                i_idx * sa->len_j + j_idx,
                                step,
@@ -478,7 +498,7 @@ rootsieve_run_multroot_lift ( node *currnode,
     while (i_idx < (long) sa->len_i) {
 
       j_idx = old_j;
-      rootsieve_run_line ( sa->array,
+      rootsieve_run_line ( sa,
                            i_idx * sa->len_j + sa->len_j - 1,
                            i_idx * sa->len_j + j_idx,
                            step, subtmp );
@@ -527,7 +547,7 @@ rootsieve_run_multroot ( sievearray_t sa,
     while (next_i < sa->len_i) {
 
       j = old_j;
-      rootsieve_run_line ( sa->array,
+      rootsieve_run_line ( sa,
                            next_i * sa->len_j + sa->len_j - 1,
                            next_i * sa->len_j + j, p, sub );
       next_i += p;
@@ -617,16 +637,38 @@ rootsieve_one_block ( sievearray_t sa,
   j_idx_i0 = (long *) malloc (ropt_primes[s2param.len_p_rs] * sizeof(long));
   roottype_flag = (char *) malloc (ropt_primes[s2param.len_p_rs]
                                    * sizeof(char));
+  /* per r < p: g(r) mod p and, if it is not 0, the one u (mod p) for
+     which p | u*g(r)^2 - numerator(r), i.e. r is a multiple root of
+     f_{u,v} (mod p). These were recomputed with mpz arithmetic for
+     every (u, r) and every block of the line. */
+  std::vector<unsigned long> g_mod (ropt_primes[s2param.len_p_rs]);
+  std::vector<unsigned long> u_mult (ropt_primes[s2param.len_p_rs]);
 
   if ( subsgl == NULL || submul == NULL || j_idx == NULL ||
        j_idx_i0 == NULL || roottype_flag == NULL ) {
     throw cado::error("Error, cannot allocate memory in {}", __func__);
   }
 
+  /* the blocks only keep the sieve in the L1 cache: they don't change
+     the result. Lines recorded for the GPU go in one block per row. */
   bblock_size = L1_cachesize;
+  {
+    static const long forced = [] {
+      const char * e = getenv ("CADO_ROPT_SIEVE_BLOCK");
+      return e ? atol (e) : 0L;
+    }();
+    if (forced > 0)
+      bblock_size = forced;
+  }
+  if (sa->ops)
+    bblock_size = s2param.Bmax - s2param.Bmin + 1;
 
+  /* at least one block, the last one going to Bmax: an array shorter
+     than bblock_size had no block at all, and was not sieved */
   totnbb = (unsigned int) ((s2param.Bmax - s2param.Bmin + 1)
                            / bblock_size);
+  if (totnbb == 0)
+    totnbb = 1;
 
 #if DEBUG_ROOTSIEVE_UV_ONEBLOCK
   fprintf ( stderr,
@@ -667,6 +709,18 @@ rootsieve_one_block ( sievearray_t sa,
     if (mpz_divisible_ui_p (s2param.MOD, pe) != 0)
       continue;
 
+    for (r = 0; r < p; r++) {
+      g_mod[r] = mpz_fdiv_ui (poly.gx[r], p);
+      if (g_mod[r] == 0)
+        continue;
+      const unsigned long g2 = g_mod[r] * g_mod[r] % p;
+      unsigned long g2inv = 1;           /* g2^(p-2) mod p */
+      for (unsigned long b = g2, e = p - 2; e; e >>= 1, b = b * b % p)
+        if (e & 1)
+          g2inv = g2inv * b % p;
+      u_mult[r] = mpz_fdiv_ui (poly.numerator[r], p) * g2inv % p;
+    }
+
     /* For each u < p */
     for (u = 0; u < p; u++) {
 
@@ -698,13 +752,12 @@ rootsieve_one_block ( sievearray_t sa,
           for (r = 0; r < p; r++) {
 
             /* skip */
-            if (mpz_divisible_ui_p(poly.gx[r], p) != 0)
+            if (g_mod[r] == 0)
               continue;
 
-            /* u*g(r)^2 - f(r)g'(r) + f'(r)g(r) */
-            mpz_mul (tmp, poly.gx[r], poly.gx[r]);
-            mpz_mul_ui (tmp, tmp, u);
-            mpz_sub (tmp, tmp, poly.numerator[r]);
+            /* p | u*g(r)^2 - f(r)g'(r) + f'(r)g(r): r is a multiple
+               root (computed once per u, below) */
+            const bool tmp_div = u_mult[r] == u;
 
             /* if nbb == 0:
                -- if i_idx == i, compute indices;
@@ -735,7 +788,7 @@ rootsieve_one_block ( sievearray_t sa,
                        - If r is multiple, do the lift;
                        - If r is simple, all slots on the array 
                        are equivalent - ignore. */
-                    if (mpz_divisible_ui_p(tmp, p) == 0)
+                    if (!tmp_div)
                       continue;
                     else
                       roottype_flag[r] = 2;
@@ -778,14 +831,16 @@ rootsieve_one_block ( sievearray_t sa,
                with respect to a line */
             else {
 
-              /* prevent overflow when len_i = 1 and j wind back,
-                 this happends since the last j-block could too 
-                 short and the previous sieve jump out of this block
-                 and hence % wind back to the beginning */
-              if ((j_idx[r] > (long) sa->len_j) && (nbb == (totnbb-1)))
-                  j_idx[r] = sa->len_j;
-              else
-                j_idx[r] %= sa->len_j;
+              /* j_idx[r] is where the line stopped in the previous
+                 block, as a position in the whole array: make it a
+                 position in row i_idx again. (This was j_idx[r] %=
+                 len_j, or len_j in the last block if j_idx[r] > len_j:
+                 for the rows i_idx >= 1 the last block of the row was
+                 then never sieved.) Past the row end, nothing is left
+                 to sieve. */
+              j_idx[r] -= i_idx * (long) sa->len_j;
+              if (j_idx[r] > (long) sa->len_j)
+                j_idx[r] = sa->len_j;
 
               /*
               if (r == 1)
@@ -802,10 +857,10 @@ rootsieve_one_block ( sievearray_t sa,
 
             /* r is a simple root for current (u, v, p). Then r
                is simple root for (u, v+i*p, p) for all i. */
-            if (mpz_divisible_ui_p(tmp, p) == 0) {
+            if (!tmp_div) {
               if (nbb != (totnbb-1)) {
                 j_idx[r] = rootsieve_run_line (
-                  sa->array,
+                  sa,
                   i_idx * sa->len_j + bblock_size * (nbb + 1),
                   i_idx * sa->len_j + j_idx[r],
                   p,
@@ -813,7 +868,7 @@ rootsieve_one_block ( sievearray_t sa,
               }
               else {
                 j_idx[r] = rootsieve_run_line (
-                  sa->array,
+                  sa,
                   i_idx * sa->len_j + (s2param.Bmax - s2param.Bmin),
                   i_idx * sa->len_j + j_idx[r],
                   p,
@@ -866,7 +921,7 @@ rootsieve_one_sublattice ( ropt_poly const & poly,
                            MurphyE_pq *global_E_pqueue)
 {
   int i;
-  unsigned long j, len_A, len_B, size_array_mem, size_B_block;
+  unsigned long len_A, len_B, size_array_mem, size_B_block;
   long tmpBmax, tmpBmin;
   double MurphyE, best_MurphyE;
   mpz_t tmpv, tmpu;
@@ -931,7 +986,14 @@ rootsieve_one_sublattice ( ropt_poly const & poly,
 #endif    
     /* root sieve for v. Note, s2param with updated Bmin 
        and Bmax will be used in rootsieve_v(). */
+    /* on the GPU: the lines are recorded, then applied there */
+    sa->ops = ropt_gpu_begin (size_array_mem);
     rootsieve_one_block (sa, poly, s2param);
+    if (sa->ops) {
+      ropt_gpu_finish (sa->ops, sievearray_init_value (),
+                       sa->array, size_array_mem);
+      sa->ops = NULL;
+    }
 #ifdef TIMING_ROPT_STAGE2
     st = milliseconds_thread () - st;
     printf ( "ropt_one : size %lu, [sieve %lu, ", size_array_mem, st);
@@ -940,25 +1002,17 @@ rootsieve_one_sublattice ( ropt_poly const & poly,
 #endif
 
     /* compute the alpha of top slots */
-    for (j = 0; j < size_array_mem; j++) {
-
-      insert_sievescore_pq ( sievescore,
-                             (j - j % (size_B_block)) / size_B_block,
-                             j % (size_B_block),
-                             sa->array[j] );
-
-#if 0
-      ij2uv (s2param.A, s2param.MOD, s2param.Amin,
-             (j - j % (size_B_block)) / size_B_block,
-             tmpu);
-      ij2uv (s2param.B, s2param.MOD, s2param.Bmin,
-             j % (size_B_block),
-             tmpv);
-      gmp_fprintf (stderr, "MAT[]: %d, u: %Zd, v: %Zd, i: %lu, "
-                   "j: %lu\n", sa->array[j], tmpu, tmpv,
-                   (j - j % (size_B_block)) / size_B_block,
-                   j % (size_B_block) );
-#endif
+    /* row by row (no division per entry), and only the entries that
+       insert_sievescore_pq would not ignore: it ignores an entry when
+       the queue is full and the entry is not below its top */
+    for (unsigned long ii = 0, jj = 0, k = 0; k < size_array_mem; k++) {
+      const int16_t a = sa->array[k];
+      if (sievescore->used < sievescore->len || a < sievescore->alpha[1])
+        insert_sievescore_pq ( sievescore, ii, jj, a );
+      if (++jj == size_B_block) {
+        jj = 0;
+        ii++;
+      }
     }
 
 #ifdef TIMING_ROPT_STAGE2
@@ -968,40 +1022,43 @@ rootsieve_one_sublattice ( ropt_poly const & poly,
     /* the following print_poly_fg ~ sieve_array 2^18  */
 #endif    
 
-    /* put sievescore into the MurphyE priority queue */
-    for (i = 1; i < sievescore->used; i ++) {
+    /* put sievescore into the MurphyE priority queue: first the
+       candidates (each one independent of the others), then their root
+       counts for alpha on the GPU in one go, then MurphyE and the
+       queue, in the same order as before */
+    {
+      const long ncand = sievescore->used - 1;
+      std::vector<cxx_mpz_poly> cand_f (ncand), cand_g (ncand);
+      std::vector<cxx_mpz> cand_u (ncand), cand_v (ncand);
+      for (i = 1; i < sievescore->used; i ++) {
 
-      ij2uv (s2param.A, s2param.MOD, s2param.Amin, sievescore->i[i],
-             tmpu);
-      ij2uv (s2param.B, s2param.MOD, s2param.Bmin, sievescore->j[i],
-             tmpv);
+        ij2uv (s2param.A, s2param.MOD, s2param.Amin, sievescore->i[i],
+               tmpu);
+        ij2uv (s2param.B, s2param.MOD, s2param.Bmin, sievescore->j[i],
+               tmpv);
 
-#if 0
-      gmp_fprintf (stderr, "(i: %lu, j: %lu) -> (u: %Zd, v: %Zd), "
-                   "score: %d\n", sievescore->i[i], sievescore->j[i],
-                   tmpu, tmpv, sievescore->alpha[i]);
-#endif
+        compute_fuv_mp (s2param.f, poly.cpoly[1], poly.cpoly[0], tmpu, tmpv);
 
-      compute_fuv_mp (s2param.f, poly.cpoly[1], poly.cpoly[0], tmpu, tmpv);
+        /* translation-only optimize */
+        mpz_poly_set (s2param.g, poly.cpoly[0]);
 
-      /* translation-only optimize */
-      mpz_poly_set (s2param.g, poly.cpoly[0]);
+        sopt_local_descent (s2param.f, s2param.g, s2param.f, s2param.g, 1, -1, SOPT_DEFAULT_MAX_STEPS, 0);
 
-      sopt_local_descent (s2param.f, s2param.g, s2param.f, s2param.g, 1, -1, SOPT_DEFAULT_MAX_STEPS, 0);
+        mpz_poly_set (cand_f[i - 1], s2param.f);
+        mpz_poly_set (cand_g[i - 1], s2param.g);
+        mpz_set (cand_u[i - 1], tmpu);
+        mpz_set (cand_v[i - 1], tmpv);
+      }
 
-#if 1
-      /* use MurphyE for ranking in the priority queue (default) */
-      MurphyE = print_poly_fg (s2param.f, s2param.g, poly.cpoly.n, 0);
-      insert_MurphyE_pq (local_E_pqueue, info->w, tmpu, tmpv,
-                         s2param.MOD, MurphyE);
-#else
-      /* use E for ranking: takes slightly less time */
-      double skew = L2_skewness (F);
-      double E = L2_lognorm (F, skew);
-      double alpha = get_alpha (F, get_alpha_bound ());
-      insert_MurphyE_pq (local_E_pqueue, info->w, tmpu, tmpv, 
-                         s2param.MOD, -(E + alpha));
-#endif
+      const bool gpu_alpha = ropt_gpu_alpha_begin (cand_f);
+      for (long k = 0; k < ncand; k++) {
+        /* use MurphyE for ranking in the priority queue */
+        MurphyE = print_poly_fg (cand_f[k], cand_g[k], poly.cpoly.n, 0);
+        insert_MurphyE_pq (local_E_pqueue, info->w, cand_u[k], cand_v[k],
+                           s2param.MOD, MurphyE);
+      }
+      if (gpu_alpha)
+        ropt_gpu_alpha_end ();
     }
 
 #ifdef TIMING_ROPT_STAGE2

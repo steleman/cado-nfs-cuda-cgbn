@@ -32,6 +32,12 @@
 #include "utils_cxx.hpp"
 #endif
 
+#ifdef HAVE_CUDA
+#include <algorithm>
+#include <vector>
+#include "polyselect_gpu_kernels.h"
+#endif
+
 /* CCS = computational collision search
  * DCS = decisional collision search
  */
@@ -1160,10 +1166,218 @@ static inline void invert_q2_mod_all_p2_subtask(polyselect_thread_ptr thread) /*
     polyselect_thread_team_leave_roaming(thread->team, thread);
 }/*}}}*/
 
+#ifdef HAVE_CUDA
+/* One GPU context per thread that leads a team (created on first use).
+ * CADO_POLYSELECT_GPU=0 turns the GPU off. */
+static struct psg_ctx * polyselect_gpu_ctx()
+{
+    static const bool enabled = [] {
+        const char * e = getenv("CADO_POLYSELECT_GPU");
+        return !(e && e[0] == '0');
+    }();
+    struct holder {
+        struct psg_ctx * c = nullptr;
+        bool tried = false;
+        ~holder() {
+            if (!c) return;
+            if (getenv("CADO_POLYSELECT_GPU_VERBOSE")) {
+                double sec;
+                unsigned long n, f, o;
+                psg_ctx_stats(c, &sec, &n, &f, &o);
+                fprintf(stderr, "# polyselect GPU: %lu special-q roots tested"
+                        " in %.2f s, %lu passed to the CPU (%lu bin overflows)\n",
+                        n, sec, f, o);
+            }
+            psg_ctx_free(c);
+        }
+    };
+    static thread_local holder h;
+    if (!enabled) return nullptr;
+    if (!h.tried) {
+        h.tried = true;
+        h.c = psg_ctx_create();
+    }
+    return h.c;
+}
+
+/* collision_on_sq_conductor with the decisional test on the GPU. Every
+ * (q, rq) that collision_on_sq_conductor would try is enumerated in the
+ * same order; the GPU tests them all, and those it flags go through the
+ * CPU passes (collision_on_each_sq_r), which give the same matches as
+ * the CPU code. Returns false, having done nothing, if the GPU cannot
+ * be used for this ad.
+ */
+static bool
+collision_on_sq_gpu(unsigned long c, polyselect_thread_ptr thread)
+{
+  if (GMP_LIMB_BITS != 64)
+    return false;
+  struct psg_ctx * ctx = polyselect_gpu_ctx();
+  if (!ctx)
+    return false;
+
+  polyselect_primes_table_srcptr pt = thread->team->league->pt;
+  polyselect_proots_srcptr R = thread->team->R;
+  std::vector<uint32_t> primes, pidx;
+  std::vector<uint64_t> roots;
+  for (unsigned long i = 0; i < pt->lenPrimes; i++) {
+      const unsigned int nr = R->nr[i];
+      if (!nr)
+          continue;
+      const auto pi = (uint32_t) primes.size();
+      primes.push_back(pt->Primes[i]);
+      for (unsigned int j = 0; j < nr; j++) {
+          roots.push_back(R->roots[i][j]);
+          pidx.push_back(pi);
+      }
+  }
+  if (roots.empty() || roots.size() != c)
+    return false;
+  /* decide before comp_sq_roots, which draws from the team's random
+   * state: from there on, there is no going back to the CPU path */
+  if (!psg_set_roots(ctx, primes.data(), primes.size(), roots.data(),
+              pidx.data(), roots.size(),
+              polyselect_main_data_get_M(thread->team->league->main)))
+    return false;
+
+  const unsigned long nq = thread->team->league->main->nq;
+
+  polyselect_qroots_t SQ_R;
+  polyselect_qroots_init(SQ_R);
+  comp_sq_roots(thread->team->header, SQ_R, thread->team->rstate);
+
+  unsigned long k;
+  unsigned long lq = find_suitable_lq(thread->team->header, SQ_R, &k,
+          thread->team->league->main);
+  unsigned long idx_q[lq], curr_nq = 0;
+  first_comb(k, idx_q);
+
+  /* the enumeration of collision_on_sq_conductor and
+   * collision_on_batch_sq_r, flattened */
+  std::vector<uint64_t> qs;
+  std::vector<uint64_t> rqs;       /* two limbs each */
+  std::vector<uint32_t> rq_qidx;
+  cxx_mpz qqz, rqz;
+  for ( ; curr_nq < nq ; ) {
+      const uint64_t q = return_q_norq(SQ_R, idx_q, k);
+      const auto qi = (uint32_t) qs.size();
+      qs.push_back(q);
+      unsigned int ind_qr[k], len_qnr[k];
+      for (unsigned long i = 0; i < k; i++) {
+          ind_qr[i] = 0;
+          len_qnr[i] = SQ_R->nr[idx_q[i]];
+      }
+      for (int re = 1; re; ) {
+          aux_return_rq(SQ_R, idx_q, ind_qr, k, qqz, rqz);
+          re = aux_nextcomb(ind_qr, k, len_qnr);
+          curr_nq++;
+          if (curr_nq >= nq)
+              re = 0;
+          /* rq < q^2 < 2^128 */
+          ASSERT_ALWAYS(mpz_sgn(rqz) >= 0 && mpz_sizeinbase(rqz, 2) <= 128);
+          rqs.push_back(mpz_getlimbn(rqz, 0));
+          rqs.push_back(mpz_size(rqz) > 1 ? mpz_getlimbn(rqz, 1) : 0);
+          rq_qidx.push_back(qi);
+      }
+      const unsigned long ret = next_comb(lq, k, idx_q);
+      if (ret == k)
+          break;
+  }
+
+  std::vector<uint8_t> flags(rq_qidx.size());
+  psg_test(ctx, qs.data(), qs.size(), rqs.data(), rq_qidx.data(),
+          rq_qidx.size(), flags.data());
+
+  /* the flagged ones on the CPU, in order */
+  auto *invqq = new unsigned long[pt->lenPrimes];
+  uint32_t inv_for = UINT32_MAX;
+
+  /* CADO_POLYSELECT_GPU_CHECK=1: for every rq, the exact answer
+   * (all values u of polyselect_proots_dispatch_to_shash_flat, sorted,
+   * two equal?) and the CPU's decisional pass, which compares 32-bit
+   * keys and so may report collisions that are not there, are compared
+   * with the GPU's flag. The flag must be the exact answer (or 1 on a
+   * bin overflow). */
+  static const bool check = getenv("CADO_POLYSELECT_GPU_CHECK") != nullptr;
+  if (check) {
+      unsigned long nexact = 0, ndcs = 0, ngpu = 0, missed = 0, extra = 0;
+      auto tq = std::make_unique<unsigned long[]>(c + 1);
+      unsigned long * tinv = tq.get();
+      tinv[c] = 0;
+      const int64_t umax = polyselect_main_data_get_M(thread->team->league->main);
+      std::vector<int64_t> us;
+      for (size_t j = 0; j < flags.size(); j++) {
+          const uint32_t qi = rq_qidx[j];
+          if (qi != inv_for) {
+              struct invert_q2_mod_all_p2_data arg[1] = {{ .invqq = invqq, .q = qs[qi] }};
+              polyselect_thread_team_post_work(thread->team, thread, invert_q2_mod_all_p2_subtask, arg);
+              inv_for = qi;
+          }
+          mpz_set_ui(rqz, 0);
+          mpz_import(rqz, 2, -1, sizeof(uint64_t), 0, 0, &rqs[2 * j]);
+          struct modcalc_arg marg[1] = {{
+              .rqqz = (const mpz_t *) &rqz.x, .count = 1,
+              .inv_qq = invqq, .tinv_qq = &tinv }};
+          polyselect_thread_team_post_work(thread->team, thread, modcalc_subtask, marg);
+          struct polyselect_DCS_flat_subtask_data darg[1] = {{
+              .invq_roots_per_prime = tinv, .found = 0 }};
+          polyselect_shash_reset_multi(thread->team->SH, thread->team->count->sync);
+          polyselect_thread_team_post_work(thread->team, thread, polyselect_DCS_flat_subtask, darg);
+
+          us.clear();
+          unsigned long z = 0;
+          for (unsigned long i = 0; i < pt->lenPrimes; i++) {
+              const int64_t ppl = (int64_t) pt->Primes[i] * (int64_t) pt->Primes[i];
+              for (unsigned int r = 0; r < R->nr[i]; r++, z++) {
+                  const int64_t u0 = tinv[z];
+                  for (int64_t u = u0; u < umax; u += ppl) us.push_back(u);
+                  for (int64_t u = u0 - ppl; u + umax >= 0; u -= ppl) us.push_back(u);
+              }
+          }
+          std::sort(us.begin(), us.end());
+          const bool exact = std::adjacent_find(us.begin(), us.end()) != us.end();
+          nexact += exact;
+          ndcs += darg->found != 0;
+          ngpu += flags[j] != 0;
+          missed += exact && !flags[j];
+          extra += !exact && flags[j];
+      }
+      fprintf(stderr, "# polyselect GPU check: %zu rq; equal values on %lu,"
+              " GPU flags %lu (missed %lu, extra %lu), CPU decisional pass %lu\n",
+              flags.size(), nexact, ngpu, missed, extra, ndcs);
+      ASSERT_ALWAYS(missed == 0);
+      inv_for = UINT32_MAX;
+  }
+  for (size_t j = 0; j < flags.size(); j++) {
+      if (!flags[j]) {
+          thread->stats->potential_collisions++;
+          continue;
+      }
+      const uint32_t qi = rq_qidx[j];
+      if (qi != inv_for) {
+          struct invert_q2_mod_all_p2_data arg[1] = {{ .invqq = invqq, .q = qs[qi] }};
+          polyselect_thread_team_post_work(thread->team, thread, invert_q2_mod_all_p2_subtask, arg);
+          inv_for = qi;
+      }
+      mpz_set_ui(rqz, 0);
+      mpz_import(rqz, 2, -1, sizeof(uint64_t), 0, 0, &rqs[2 * j]);
+      const mpz_t * one = (const mpz_t *) &rqz.x;
+      collision_on_each_sq_r(qs[qi], one, invqq, c, 1, thread);
+  }
+  delete[] invqq;
+  polyselect_qroots_clear(SQ_R);
+  return true;
+}
+#endif
+
 /* collision on special-q, call collision_on_batch_sq */
 void
 collision_on_sq_conductor(unsigned long c, polyselect_thread_ptr thread)
 {
+#ifdef HAVE_CUDA
+  if (collision_on_sq_gpu(c, thread))
+    return;
+#endif
   auto *invqq = new unsigned long[thread->team->league->pt->lenPrimes];
   if (!invqq)
     {

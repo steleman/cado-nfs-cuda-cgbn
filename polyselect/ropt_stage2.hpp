@@ -9,10 +9,14 @@
 /**
  * Sieving array 
  */
+struct ropt_sieve_op;
 struct sievearray_s {
   int16_t *array;
   unsigned int len_i;
   unsigned int len_j;
+  /* if not NULL, rootsieve_run_line records its lines here instead of
+     sieving (they are applied on the GPU) */
+  struct ropt_sieve_oplist * ops;
 };
 typedef struct sievearray_s sievearray_t[1];
 

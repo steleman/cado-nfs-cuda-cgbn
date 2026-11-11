@@ -370,15 +370,18 @@ struct ringbuf {
     int strchr(int c, size_t offset) const
     {
         ASSERT_ALWAYS(offset <= get_avail_to_read_safe());
-        size_t tail = alloc - (rhead - p.get());
+        /* bytes [0, tail) of the readable data are at rhead[], the rest
+         * wraps around to p[0]. The second part used to start at p[0]
+         * whatever the offset, which is wrong for an offset beyond the
+         * wrap point (no caller passed one then). */
+        size_t const tail = alloc - (rhead - p.get());
         size_t s = offset;
-        for(; s < tail ; s++) {
+        for(; s < tail && s < avail_to_read ; s++) {
             if (rhead[s] == c)
                 return static_cast<int>(s);
         }
-        tail = avail_to_read - s;
-        for(int t = 0 ; static_cast<size_t>(t) < tail ; s++,t++) {
-            if (p[t] == c)
+        for(; s < avail_to_read ; s++) {
+            if (p[s - tail] == c)
                 return static_cast<int>(s);
         }
         return -1;
@@ -437,6 +440,17 @@ struct ringbuf {
 
     const_iterator begin() const {
         return { *this, rhead };
+    }
+    /* the byte at offset off from the read head, as an iterator */
+    const_iterator at(size_t off) const {
+        return { *this, p.get() + ((rhead - p.get()) + off) % alloc };
+    }
+    /* copies n bytes from offset off from the read head (not consumed) */
+    void copy_out(size_t off, size_t n, char * dst) const {
+        size_t const start = ((rhead - p.get()) + off) % alloc;
+        size_t const first = std::min(n, alloc - start);
+        std::copy_n(p.get() + start, first, dst);
+        std::copy_n(p.get(), n - first, dst + first);
     }
     const_iterator end() const {
         return { *this, p.get() + ((rhead - p.get()) + avail_to_read) % alloc };

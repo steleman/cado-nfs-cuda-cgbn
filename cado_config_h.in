@@ -58,6 +58,10 @@
 
 #cmakedefine HAVE_GAS_SYNTAX_ASSEMBLY_SOURCES
 
+/* NVIDIA GPU code (bwc mm_impl=cuda) */
+#cmakedefine HAVE_CUDA
+#cmakedefine HAVE_NCCL
+
 #cmakedefine HAVE_EXECINFO
 
 #cmakedefine STATIC_ANALYSIS

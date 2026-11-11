@@ -269,6 +269,13 @@ static void alternative_reduce_scatter_parallel [[maybe_unused]] (pi_comm & xr, 
     unsigned int const rank = wr.jrank;
     MPI_Datatype const t = v.pitype->datatype;
 
+    /* One job: the loop below would zero rsbuf[0], add our first
+     * eitems items into it and copy them back, i.e. leave sibling(0)
+     * unchanged at the cost of three passes over the data. njobs is
+     * the same for every thread of xr, so they all leave here. */
+    if (njobs == 1)
+        return;
+
     /* If the rsbuf[] buffers have not yet been allocated, it is time to
      * do so now. We also take the opportunity to possibly re-allocate
      * them if because of a larger abase, the corresponding storage has

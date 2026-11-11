@@ -306,9 +306,46 @@ namespace cado_math_aux
     inline double fma(double x, double y, double z) { return std::fma(x, y, z); }
     inline long double fma(long double x, long double y, long double z) { return std::fmal(x, y, z); }
     */
-    using std::fma;
-    inline float fms(float x, float y, float z) { return std::fmaf(x, y, -z); }
-    inline double fms(double x, double y, double z) { return std::fma(x, y, -z); }
+    /* Without -mfma (the default build), std::fma is a call into libm
+     * through the PLT, a large part of the time of real root finding
+     * (polynomial<double>::roots: polyselect's size optimization, las's
+     * norm set-up). The FMA instruction gives exactly the same result
+     * (a fused multiply-add is correctly rounded either way), so use it
+     * inline when the CPU has it. */
+#if defined(__x86_64__) && defined(__GNUC__) && !defined(__FMA__) \
+        && !defined(__CUDA_ARCH__) && defined(__AVX__)
+#define CADO_MATH_AUX_FMA_ASM 1
+    inline bool const cpu_has_fma = __builtin_cpu_supports("fma");
+#endif
+    inline double fma(double x, double y, double z) {
+#ifdef CADO_MATH_AUX_FMA_ASM
+        if (cpu_has_fma) {
+            /* x = y * x + z */
+            __asm__("vfmadd213sd %2, %1, %0" : "+x"(x) : "x"(y), "x"(z));
+            return x;
+        }
+#endif
+        return std::fma(x, y, z);
+    }
+    inline float fma(float x, float y, float z) {
+#ifdef CADO_MATH_AUX_FMA_ASM
+        if (cpu_has_fma) {
+            __asm__("vfmadd213ss %2, %1, %0" : "+x"(x) : "x"(y), "x"(z));
+            return x;
+        }
+#endif
+        return std::fmaf(x, y, z);
+    }
+    inline long double fma(long double x, long double y, long double z) { return std::fmal(x, y, z); }
+    /* other arithmetic arguments (integers, mixed types): as std::fma
+     * (the exact float/double/long double overloads above win when they
+     * match) */
+    template<typename A, typename B, typename C>
+        requires (std::is_arithmetic_v<A> && std::is_arithmetic_v<B>
+                && std::is_arithmetic_v<C>)
+    inline auto fma(A x, B y, C z) { return std::fma(x, y, z); }
+    inline float fms(float x, float y, float z) { return fma(x, y, -z); }
+    inline double fms(double x, double y, double z) { return fma(x, y, -z); }
     inline long double fms(long double x, long double y, long double z) { return std::fma(x, y, -z); }
     inline cxx_mpz fma(cxx_mpz const & x, cxx_mpz const & y, cxx_mpz const & z) {
         cxx_mpz res = z;

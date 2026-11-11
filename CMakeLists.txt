@@ -63,6 +63,69 @@ endif()
 
 enable_language(ASM)
 
+# Optional NVIDIA GPU support (all the GPU code). On by default when
+# nvcc is found; -DENABLE_CUDA=OFF turns it off (with the top-level
+# Makefile: CMAKE_EXTRA_ARGS="-DENABLE_CUDA=OFF", in local.sh or the
+# environment). CMAKE_CUDA_ARCHITECTURES, if not given, is
+# $CADO_CUDA_ARCHITECTURES, else the GPUs of the build host, else (a
+# build host without a GPU, such as a cluster's login node) the
+# production GPUs: B200 (sm_100) and RTX PRO 6000 (sm_120), with PTX for
+# later ones.
+option(ENABLE_CUDA "Build the NVIDIA GPU code (bwc mm_impl=cuda)" ON)
+if(ENABLE_CUDA)
+    include(CheckLanguage)
+    check_language(CUDA)
+    if(CMAKE_CUDA_COMPILER)
+        if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+            if(DEFINED ENV{CADO_CUDA_ARCHITECTURES})
+                set(CMAKE_CUDA_ARCHITECTURES "$ENV{CADO_CUDA_ARCHITECTURES}")
+            else()
+                execute_process(COMMAND nvidia-smi --query-gpu=compute_cap
+                    --format=csv,noheader
+                    RESULT_VARIABLE cado_smi_result
+                    OUTPUT_VARIABLE cado_smi_caps ERROR_QUIET)
+                if(cado_smi_result EQUAL 0 AND cado_smi_caps MATCHES "[0-9]")
+                    set(CMAKE_CUDA_ARCHITECTURES native)
+                else()
+                    set(CMAKE_CUDA_ARCHITECTURES "100-real;120-real;120-virtual")
+                endif()
+            endif()
+        endif()
+        enable_language(CUDA)
+        set(CMAKE_CUDA_STANDARD 20)
+        set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+        find_package(CUDAToolkit REQUIRED)
+        set(HAVE_CUDA 1)
+        # CGBN (header only): the cofactor filter of las, the signs of
+        # characters. $CGBN_HOME/include, else the usual places.
+        find_path(CGBN_INCLUDE_DIR cgbn/cgbn.h
+            HINTS ENV CGBN_HOME PATH_SUFFIXES include
+            PATHS /usr/local/include /usr/include)
+        if(NOT CGBN_INCLUDE_DIR)
+            message(FATAL_ERROR "CUDA is enabled but cgbn/cgbn.h was not found;"
+                " set CGBN_HOME, or -DENABLE_CUDA=OFF")
+        endif()
+        message(STATUS "CGBN: ${CGBN_INCLUDE_DIR}")
+        message(STATUS "CUDA enabled: ${CMAKE_CUDA_COMPILER} (architectures ${CMAKE_CUDA_ARCHITECTURES})")
+        # NCCL: GPU to GPU exchanges in bwc with several MPI jobs
+        option(ENABLE_NCCL "Use NCCL for multi-GPU bwc" ON)
+        if(ENABLE_NCCL)
+            find_path(NCCL_INCLUDE_DIR nccl.h
+                HINTS ENV NCCL_HOME PATH_SUFFIXES include)
+            find_library(NCCL_LIBRARY nccl
+                HINTS ENV NCCL_HOME PATH_SUFFIXES lib lib64)
+            if(NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
+                set(HAVE_NCCL 1)
+                message(STATUS "NCCL enabled: ${NCCL_LIBRARY}")
+            else()
+                message(STATUS "NCCL not found; multi-GPU bwc exchanges go through MPI")
+            endif()
+        endif()
+    else()
+        message(STATUS "CUDA not found; GPU code disabled")
+    endif()
+endif()
+
 # must be done early, but after project()
 include(config/xcode.cmake)
 

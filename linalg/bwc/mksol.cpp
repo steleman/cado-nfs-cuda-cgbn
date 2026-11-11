@@ -9,6 +9,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <utility>
 
 #include <gmp.h>
 #include "fmt/base.h"
@@ -31,6 +32,9 @@
 #include "bwc_filenames.hpp"
 #include "utils_cxx.hpp"
 #include "cado_main.hpp"
+#ifdef HAVE_CUDA
+#include "matmul-cuda-kernels.h"
+#endif
 
 static void * mksol_prog(parallelizing_info & pi, cxx_param_list & pl, void * arg MAYBE_UNUSED)
 {
@@ -243,6 +247,41 @@ static void * mksol_prog(parallelizing_info & pi, cxx_param_list & pl, void * ar
     }
     /* }}} */
 
+#ifdef HAVE_CUDA
+    /* One GPU does the whole product: keep y, the vi and the F
+     * coefficients of a window on it. */
+    mmt_cuda gpu(mmt, ymy[0], ymy[1]);
+    bwc_cuda_mat * G = gpu ? gpu.mat() : nullptr;
+    size_t const gpu_ybytes = gpu.vbytes;
+    /* the whole slice: addmul_tiny on it gives every job sharing the
+     * slice the same result, so no broadcast is needed after it */
+    size_t const gpu_vibytes = Av->vec_elt_stride(gpu.vitems);
+    size_t const gpu_fbytes = one_fcoeff * bw->interval;
+    void * gpu_y[2] = { nullptr, nullptr };
+    std::vector<void *> gpu_vi(Av_multiplex, nullptr);
+    std::vector<void *> gpu_f(Av_multiplex, nullptr);
+    if (G) {
+        for(auto const & v : vi)
+            ASSERT_ALWAYS(v.i1 - v.i0 == gpu.vitems);
+        ASSERT_ALWAYS(Av->simd_groupsize() % 64 == 0);
+        ASSERT_ALWAYS(As->simd_groupsize() % 64 == 0);
+        gpu_y[0] = bwc_cuda_alloc(G, gpu.tmpbytes);
+        gpu_y[1] = bwc_cuda_alloc(G, gpu.tmpbytes);
+        for(auto & p : gpu_vi) p = bwc_cuda_alloc(G, gpu_vibytes);
+        for(auto & p : gpu_f) p = bwc_cuda_alloc(G, gpu_fbytes);
+        if (tcan_print)
+            fmt::print("mksol: vectors kept on GPU {} (communication: {})\n",
+                    bwc_cuda_mat_device(G), gpu.comm_name());
+    }
+    auto clean_gpu = call_dtor([&]() {
+        if (!G) return;
+        bwc_cuda_free(G, gpu_y[0]);
+        bwc_cuda_free(G, gpu_y[1]);
+        for(auto p : gpu_vi) bwc_cuda_free(G, p);
+        for(auto p : gpu_f) bwc_cuda_free(G, p);
+    });
+#endif
+
     unsigned int bw_end_copy = bw->end; /* avoid race conditions w/ interleaving */
     pi.interleaving_flip();
     pi.interleaving_flip();
@@ -409,6 +448,36 @@ static void * mksol_prog(parallelizing_info & pi, cxx_param_list & pl, void * ar
 
                 size_t const eblock = mmt_my_own_size_in_items(ymy[0]);
 
+#ifdef HAVE_CUDA
+                if (G) {
+                    unsigned int const K = Av->simd_groupsize() / 64;
+                    unsigned int const L = As->simd_groupsize() / 64;
+                    for(unsigned int i = 0 ; i < Av_multiplex ; i++) {
+                        bwc_cuda_upload(G, gpu_vi[i], vi[i].v, gpu_vibytes);
+                        bwc_cuda_upload(G, gpu_f[i], fcoeffs[i * As_multiplex], gpu_fbytes);
+                    }
+                    bwc_cuda_upload(G, gpu_y[0], ymy[0].v, gpu_ybytes);
+                    for(unsigned int k = 0 ; k < s1 - s0 ; k++) {
+                        for(unsigned int i = 0 ; i < Av_multiplex ; i++) {
+                            bwc_cuda_addmul_tiny(G, gpu_y[0], gpu_vi[i],
+                                    (char *) gpu_f[i] + As->vec_elt_stride(
+                                        (s1 - s0 - 1 - k) * Av->simd_groupsize()),
+                                    gpu.vitems, K, L);
+                        }
+                        /* see below */
+                        if (i_window < n_windows-1 || k < s1 - s0 - 1) {
+                            gpu.mul(gpu_y[0], gpu_y[1]);
+                            bwc_cuda_sync(G);
+                            /* the four timers matmul_top_mul would switch */
+                            for(int t = 0 ; t < 4 ; t++)
+                                timing_next_timer(timing);
+                            timing_check(pi, timing, s + sx - s1 + k + 1, tcan_print);
+                        }
+                    }
+                    bwc_cuda_download(G, ymy[0].v, gpu_y[0], gpu_ybytes);
+                    ymy[0].consistency = 2;
+                } else
+#endif
                 for(unsigned int k = 0 ; k < s1 - s0 ; k++) {
 
                     pi.m.serialize_threads(__FILE__, __LINE__);

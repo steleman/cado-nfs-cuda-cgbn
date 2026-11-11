@@ -28,6 +28,7 @@
  * compilers.
  */
 #include <cstdio>
+#include <vector>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
@@ -56,6 +57,7 @@
 #include "polyselect_special_q.h"
 #include "portability.h"
 #include "size_optimization.hpp"
+#include "sopt_gpu.hpp"
 #include "timing.h"		// for seconds
 #include "verbose.hpp"		// verbose_output_print
 #include "getprime.h"
@@ -97,9 +99,13 @@ check_divexact(mpz_ptr r, mpz_srcptr d, const char *d_name MAYBE_UNUSED,
 }
 
 
-void
-polyselect_process_match_async(polyselect_thread_league_srcptr league, polyselect_stats_ptr stats, polyselect_match_info_ptr job)
+/* The raw pair (f, g) of a match, and its statistics. Returns false if it
+ * is not to be size-optimized. */
+static bool
+polyselect_match_raw(polyselect_thread_league_srcptr league, polyselect_stats_ptr stats, polyselect_match_info_ptr job,
+        cxx_mpz_poly & f_raw, cxx_mpz_poly & g_raw)
 {
+  bool ret = false;
   polyselect_poly_header_srcptr header = job->header;
   unsigned long p1 = job->p1;
   unsigned long p2 = job->p2;
@@ -109,7 +115,7 @@ polyselect_process_match_async(polyselect_thread_league_srcptr league, polyselec
 
 
   mpz_t l, mtilde, m, adm1, t, k;
-  cxx_mpz_poly f, g, f_raw, g_raw;
+  cxx_mpz_poly f, g;
   int cmp;
 
   /* the expected rotation space is S^5 for degree 6 */
@@ -306,22 +312,32 @@ polyselect_process_match_async(polyselect_thread_league_srcptr league, polyselec
   if (!mpz_poly_has_trivial_content(f)) 
       goto end;
 
-  /* enter size optimization */
+  g_raw = g;
+  f_raw = f;
+  ret = true;
 
-  {
-      double st = seconds_thread();
-      g_raw = g;
-      f_raw = f;
-      size_optimization(f, g, f_raw, g_raw, league->main->sopt_effort, league->main->verbose);
-      stats->optimize_time += seconds_thread() - st;
-      stats->opt_found++;
-  }
+end:
+  mpz_clear(l);
+  mpz_clear(m);
+  mpz_clear(t);
+  mpz_clear(k);
+  mpz_clear(adm1);
+  mpz_clear(mtilde);
+  return ret;
+}
 
+/* After the size optimization of a match: statistics and output */
+static void
+polyselect_match_after_sopt(polyselect_thread_league_srcptr league, polyselect_stats_ptr stats,
+        polyselect_poly_header_srcptr header,
+        cxx_mpz_poly const & f_raw, cxx_mpz_poly const & g_raw,
+        cxx_mpz_poly const & f, cxx_mpz_poly const & g)
+{
   /* polynomials with f[d-1] * f[d-3] > 0 *after* size-optimization
      give worse exp_E values */
   if (mpz_sgn(mpz_poly_coeff_const(f, f->deg - 1)) * mpz_sgn(mpz_poly_coeff_const(f, f->deg - 3)) > 0) {
       stats->discarded2++;
-      goto end;
+      return;
   }
 
   /* register all stat to the stats object. This is a local
@@ -358,15 +374,49 @@ polyselect_process_match_async(polyselect_thread_league_srcptr league, polyselec
           pthread_mutex_unlock(&iolock);
       }
   }
+}
 
+void
+polyselect_process_match_async(polyselect_thread_league_srcptr league, polyselect_stats_ptr stats, polyselect_match_info_ptr job)
+{
+  cxx_mpz_poly f, g, f_raw, g_raw;
+  if (!polyselect_match_raw(league, stats, job, f_raw, g_raw))
+      return;
+  /* enter size optimization */
+  {
+      double st = seconds_thread();
+      size_optimization(f, g, f_raw, g_raw, league->main->sopt_effort, league->main->verbose);
+      stats->optimize_time += seconds_thread() - st;
+      stats->opt_found++;
+  }
+  polyselect_match_after_sopt(league, stats, job->header, f_raw, g_raw, f, g);
+}
 
-end:
-  mpz_clear(l);
-  mpz_clear(m);
-  mpz_clear(t);
-  mpz_clear(k);
-  mpz_clear(adm1);
-  mpz_clear(mtilde);
+/* polyselect_process_match_async on several matches, in order, with
+ * their size optimizations done together (size_optimization_batch, whose
+ * descents run on the GPU when it is used): the same statistics and the
+ * same output. */
+static void
+polyselect_process_matches_batch(polyselect_thread_league_srcptr league, polyselect_stats_ptr stats,
+        std::vector<polyselect_match_info_ptr> const & jobs)
+{
+  std::vector<sopt_batch_item> items;
+  std::vector<polyselect_match_info_ptr> which;
+  for (auto job : jobs) {
+      sopt_batch_item it;
+      if (polyselect_match_raw(league, stats, job, it.f_raw, it.g_raw)) {
+          items.push_back(it);
+          which.push_back(job);
+      }
+  }
+  double st = seconds_thread();
+  size_optimization_batch(items, league->main->sopt_effort, league->main->verbose);
+  stats->optimize_time += seconds_thread() - st;
+  for (size_t i = 0; i < items.size(); i++) {
+      stats->opt_found++;
+      polyselect_match_after_sopt(league, stats, which[i]->header,
+              items[i].f_raw, items[i].g_raw, items[i].f_opt, items[i].g_opt);
+  }
 }
 
 #if 0
@@ -475,16 +525,27 @@ void * thread_loop(polyselect_thread_ptr thread)
         /* is there an async job ready ? */
         struct dllist_head * ptr = dllist_get_first_node(&league->async_jobs);
         if (ptr) {
-            dllist_pop(ptr);
+            /* with the size optimization on the GPU, all the waiting
+             * jobs at once (their descents are run together) */
+            std::vector<polyselect_match_info_ptr> jobs;
+            const size_t max_jobs = sopt_gpu_enabled() ? 65536 : 1;
+            for ( ; ptr && jobs.size() < max_jobs ;
+                    ptr = dllist_get_first_node(&league->async_jobs)) {
+                dllist_pop(ptr);
+                jobs.push_back(dllist_entry(ptr, struct polyselect_match_info_s, queue));
+            }
             pthread_mutex_unlock(league_lock);
-            polyselect_match_info_ptr job = dllist_entry(ptr, struct polyselect_match_info_s, queue);
 
             polyselect_thread_team_enter_async(team, thread);
             pthread_mutex_unlock(team_lock);
             /********* BEGIN UNLOCKED SECTION **************/
             polyselect_thread_chronogram_chat(thread, "enter match");
-            polyselect_process_match_async(league, thread->stats, job);
-            dllist_push_back(&thread->empty_job_slots, &job->queue);
+            if (jobs.size() == 1)
+                polyselect_process_match_async(league, thread->stats, jobs[0]);
+            else
+                polyselect_process_matches_batch(league, thread->stats, jobs);
+            for (auto job : jobs)
+                dllist_push_back(&thread->empty_job_slots, &job->queue);
             polyselect_thread_chronogram_chat(thread, "leave match");
             /********** END UNLOCKED SECTION ***************/
             pthread_mutex_lock(team_lock);

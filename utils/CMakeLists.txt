@@ -25,7 +25,7 @@ set (sources
         double_poly.cpp rootfinder.cpp params.cpp gcd.c cado_main.cpp
         gzip.cpp misc.c misc2.cpp utils_cxx.cpp
         fstream_maybe_compressed.cpp
-        mpz_mat.cpp mpz_poly.cpp crc.c purgedfile.c bit_vector.c
+        mpz_mat.cpp mpz_poly.cpp gmp_mul_hook.cpp gpu_claim.cpp crc.c purgedfile.c bit_vector.c
         barrier.c usp.cpp fix-endianness.c memusage.cpp
         cachesize_cpuid.c cachesize_guess.cpp roots_mod.cpp
         renumber.cpp

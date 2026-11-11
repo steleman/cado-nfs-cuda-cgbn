@@ -50,6 +50,12 @@
 #include "usp.h"
 #include "utils_cxx.hpp"
 
+/* large products may go to a replacement (the GPU, in sqrt): see
+ * gmp_mul_hook.hpp */
+#include "gmp_mul_hook.hpp"
+#undef mpz_mul
+#define mpz_mul cado_mpz_mul
+
 // scan-headers: stop here
 #ifdef MPZ_POLY_TIMINGS
 #include "timing.h"

@@ -90,6 +90,11 @@ public:
     void set_g(const fbprime_t g) {ASSERT(is_proj()); ASSERT(g > 0); r = g;}
     void set_U(const fbprime_t U) {ASSERT(is_proj()); offset = U;}
 
+    /* the raw fields, whatever the kind of entry */
+    fbprime_t raw_p() const {return p;}
+    fbprime_t raw_r() const {return r;}
+    fbprime_t raw_offset() const {return offset;}
+
     bool is_pow2() const {return (flags & SSP_POW2) != 0;}
     bool is_proj() const {return (flags & SSP_PROJ) != 0;}
     bool is_nice() const {return !is_pow2() && !is_proj();}
@@ -183,6 +188,12 @@ public:
             sublat_runtime_t const & sl,
             where_am_I & w MAYBE_UNUSED) final;
 
+    /* read access for the GPU siever (las-sieve-gpu.cpp): the entries
+     * of this special-q, the first resieve_end_offset of ssps being the
+     * resieved ones */
+    std::vector<ssp_simple_t> const & get_ssps() const { return ssps; }
+    std::vector<ssp_t> const & get_ssp() const { return ssp; }
+    size_t get_resieve_end_offset() const { return resieve_end_offset; }
 protected:
     void small_sieve_start(
             std::vector<spos_t> & ssdpos,

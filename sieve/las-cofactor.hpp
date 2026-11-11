@@ -88,12 +88,22 @@ inline facul_strategies * facul_make_strategies (siever_config const & conf, FIL
         *pncurves++ = s.ncurves;
     }
 
+    /* "Perfectly sieved" would let facul take any cofactor below lim^2
+     * for a prime without testing it. las cannot promise that: besides
+     * the primes that sublattices skip, the special-q prime itself is
+     * never sieved nor divided out again (only the factors of a
+     * composite q are, in cofactoring_sync), so with q < lim the leftover
+     * can be q times a prime above lim, a composite below lim^2. This
+     * used to read (conf.sublat_bound == 0), which is never true (no
+     * sublattices is sublat_bound == 1), so the value was always false;
+     * it is now false on purpose. */
+    bool const perfectly_sieved = false;
     if (file) {
         return new facul_strategies(
                 lim,
                 lpb,
                 mfb,
-                (conf.sublat_bound == 0), // with sublat, some primes are skipped.
+                perfectly_sieved,
                 file, verbose);
     } else {
         return new facul_strategies(
@@ -101,7 +111,7 @@ inline facul_strategies * facul_make_strategies (siever_config const & conf, FIL
                 lpb,
                 mfb,
                 ncurves,
-                (conf.sublat_bound == 0), // with sublat, some primes are skipped.
+                perfectly_sieved,
                 verbose);
     }
 }

@@ -27,6 +27,7 @@
 #include "las-bkmult.hpp"
 #include "las-config.hpp"
 #include "las-fill-in-buckets.hpp"
+#include "las-fill-gpu.hpp"
 #include "las-process-bucket-region.hpp"
 #include "las-siever-config.hpp"
 #include "las-threads-work-data.hpp"
@@ -367,6 +368,10 @@ void fill_in_buckets_toplevel_entry(nfs_work & ws, nfs_aux & aux,
 {
     // per se, we're not doing anything here.
     // CHILD_TIMER(timer, __func__);
+#ifndef SIQS_SIEVE
+    if (fill_in_buckets_toplevel_gpu(ws, aux, Q, pool, side, w))
+        return;
+#endif
     if (ws.conf.needs_resieving()) {
         fib_one_side<MAX_TOPLEVEL, shorthint_t>(ws, aux, Q, pool, side, w);
     } else {

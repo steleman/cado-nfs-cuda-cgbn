@@ -109,6 +109,7 @@ typedef struct prac_cost_s prac_cost_t;
 void bytecode_prac_encode (bytecode *, unsigned int, unsigned int, unsigned int,
                            const prac_cost_t *, int, int);
 int bytecode_prac_check (bytecode_const, mpz_srcptr, int);
+int bytecode_prac_scalar (bytecode_const, mpz_ptr);
 void bytecode_prac_cache_free ();
 
 
@@ -126,6 +127,7 @@ typedef struct mishmash_cost_s mishmash_cost_t;
 void bytecode_mishmash_encode (bytecode *, unsigned int, unsigned int,
                                unsigned int, const mishmash_cost_t *, int, int);
 int bytecode_mishmash_check (bytecode_const, mpz_srcptr, int);
+int bytecode_mishmash_scalar (bytecode_const, mpz_ptr);
 
 #ifdef __cplusplus
 }

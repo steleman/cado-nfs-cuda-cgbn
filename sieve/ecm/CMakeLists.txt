@@ -65,3 +65,24 @@ target_link_libraries(precompbatch PRIVATE las_core_0 facul utils)
 mark_targets_as_openmp(precompbatch)
 
 include(CMakeLists-nodist.txt OPTIONAL)
+
+# GPU cofactorization (facul-gpu.hpp). facul_gpu is always built; without
+# CUDA it is a stub that sends everything back to the CPU.
+add_library(facul_gpu STATIC facul-gpu.cpp)
+set_target_properties(facul_gpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(facul_gpu PUBLIC utils ${gmp_libname})
+# everything that links facul (las and its variants) gets it
+target_link_libraries(facul PUBLIC facul_gpu)
+if(HAVE_CUDA)
+    add_library(facul_gpu_kernels STATIC facul-gpu-kernels.cu)
+    # cado_gpu_claim (utils/gpu_claim.cpp)
+    target_link_libraries(facul_gpu_kernels PUBLIC utils)
+    set_target_properties(facul_gpu_kernels PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        CUDA_RUNTIME_LIBRARY Shared)
+    target_compile_options(facul_gpu_kernels PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+    target_link_libraries(facul_gpu PUBLIC facul_gpu_kernels CUDA::cudart)
+    add_executable(facul_gpu_test facul-gpu-test.cpp)
+    target_link_libraries(facul_gpu_test PRIVATE facul utils)
+endif()

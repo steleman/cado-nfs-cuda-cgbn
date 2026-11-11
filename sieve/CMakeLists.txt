@@ -83,11 +83,14 @@ set(las_multi_a_sources
         bucket.cpp
         las-config.cpp
         las-fill-in-buckets.cpp
+        las-fill-gpu.cpp
+        las-sieve-gpu.cpp
         las-downsort.cpp
         las-smallsieve.cpp
         siqs-smallsieve.cpp
         las-cofac-standalone.cpp
         las-detached-cofac.cpp
+        las-cofac-gpu.cpp
         las-process-bucket-region.cpp
         las-output.cpp
         las-multiobj-globals.cpp
@@ -152,6 +155,26 @@ set_property(TARGET las_descent PROPERTY COMPILE_DEFINITIONS DLP_DESCENT SUPPORT
 
 add_subdirectory(ecm)
 add_subdirectory(strategies)
+
+if(HAVE_CUDA)
+    # GPU bucket fill (las-fill-gpu.cpp); every las variant links facul
+    add_library(las_gpu_kernels STATIC las-fill-gpu-kernels.cu
+        las-sieve-gpu-kernels.cu las-sieve-gpu-cofilter.cu)
+    # cado_gpu_claim (utils/gpu_claim.cpp)
+    target_link_libraries(las_gpu_kernels PUBLIC utils)
+    # CGBN (the cofactor filter)
+    target_include_directories(las_gpu_kernels PRIVATE ${CGBN_INCLUDE_DIR})
+    # the lognorms must use the CPU's double operations (no FMA there)
+    set_source_files_properties(las-sieve-gpu-kernels.cu las-sieve-gpu-cofilter.cu
+        PROPERTIES COMPILE_OPTIONS "-fmad=false")
+    set_target_properties(las_gpu_kernels PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        CUDA_RUNTIME_LIBRARY Shared)
+    target_compile_options(las_gpu_kernels PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+    target_link_libraries(las_gpu_kernels PUBLIC CUDA::cudart)
+    target_link_libraries(facul PUBLIC las_gpu_kernels)
+endif()
 
 # pulling las_core_b is overkill, here
 add_executable(dupsup dupsup.cpp las-where-am-i-prod.cpp)

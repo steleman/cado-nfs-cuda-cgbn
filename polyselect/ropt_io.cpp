@@ -43,9 +43,15 @@ ropt_L1_cachesize ()
     }
   }
 #endif
-  /* since we sieve from -size_tune_sievearray to size_tune_sievearray,
-     we set size_tune_sievearray to half the L1 cache size */
-  size_tune_sievearray = L1_cachesize / 2;
+  /* size_tune_sievearray (the tuning sieves go from
+     -size_tune_sievearray to size_tune_sievearray) used to be half of
+     this L1 cache size; but it changes what is computed, so the same
+     input gave different tunings on different processors, and even on
+     one hybrid processor (a 13900K reports 65536 on its P-cores, 32768
+     on its E-cores). It is now fixed at 16384 (half of the usual 32 KB);
+     L1_cachesize only sets the sieve blocks, which don't change the
+     result. */
+  size_tune_sievearray = 16384;
 }
 
 /**

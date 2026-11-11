@@ -51,6 +51,11 @@ simd                 SIMD width to be used for krylov (ys=) and mksol,
                      prime=2 or 1 otherwise
 lingen_mpi           like mpi, but for lingen only
 lingen_thr           like thr, but for lingen only
+gpu                  auto (default), 1 or 0: run the products on the GPU
+                     when this is a CUDA build and there is one (see the
+                     "GPU defaults" comment in this script)
+gpu_block            with the GPU, the default m=n=64 becomes m=n=simd=
+                     this value (default 128; 64 keeps 64)
 
 matrix               input matrix file. Must be a complete path. Binary, 32-b LE
 rhs                  rhs file for inhomogeneous systems (ascii with header)
@@ -176,6 +181,121 @@ for my $k (keys %$param_defaults) {
     next if exists $param->{$k};
     $param->{$k} = $param_defaults->{$k};
 }
+
+# {{{ GPU defaults (CUDA builds, GF(2))
+# gpu=auto (default): if the cuda matmul backend was built and there is a
+# GPU, and mm_impl is not set to something else, then
+#   - mm_impl=cuda; one GPU per matrix block: with several GPUs, an MPI
+#     build runs one job per GPU (mpi=<ngpu>, thr=1) and keeps the
+#     vectors on the GPUs, exchanging them with NCCL; without MPI it
+#     runs one thread per GPU (thr=<ngpu>) with the vectors on the host.
+#     With one GPU, or mpi= given, thr=1. krylov, mksol and secure keep
+#     their vectors on the GPU whenever each job has one thread;
+#   - lingen, which stays on the CPU, gets the threads instead
+#     (lingen_thr= the thr= that was asked for, unless set);
+#   - the default block size m=n=64 becomes m=n=simd=gpu_block (128):
+#     a 128-bit product costs the GPU about what a 64-bit one does, so
+#     krylov and mksol need half the products (not for matrices of fewer
+#     than 16*(m+n) rows, for which 64 stays);
+# gpu=0 keeps the CPU code; gpu=1 fails if there is no GPU.
+{
+    my $gpu = $param->{'gpu'} // 'auto';
+    delete $param->{'gpu'};
+    my $gpu_block = $param->{'gpu_block'} // 128;
+    delete $param->{'gpu_block'};
+    $gpu =~ /^(auto|0|1)$/ or die "gpu= must be auto, 0 or 1\n";
+    my $want = $gpu ne '0' && $param->{'prime'} eq '2'
+        && (!defined($param->{'mm_impl'}) || $param->{'mm_impl'} eq 'cuda');
+    my $ngpu = 0;
+    if ($want && -x "$bindir/cuda_devices") {
+        $ngpu = `"$bindir/cuda_devices" 2>/dev/null`;
+        chomp $ngpu;
+        $ngpu = 0 unless defined($ngpu) && $ngpu =~ /^\d+$/;
+    }
+    # Several nodes (hosts=, hostfile=, or a Slurm allocation): one MPI
+    # job per GPU of every node. CADO_BWC_GPUS_PER_NODE gives the GPUs of
+    # a node, for instance when bwc.pl is started on a node that has none
+    # (cado-nfs.py's server); it defaults to this node's.
+    my $nnodes = 0;
+    {
+        my %h;
+        if (defined(my $hv = $param->{'hosts'})) {
+            for my $x (ref $hv eq 'ARRAY' ? @$hv : ($hv)) {
+                $h{$_}=1 for grep { /\S/ } split(',', $x);
+            }
+        } elsif (defined(my $hf = $param->{'hostfile'})) {
+            if (open my $fh, '<', $hf) {
+                while (<$fh>) {
+                    s/#.*//; s/^\s+//; s/\s.*//s;
+                    s/:.*//;            # node:slots
+                    $h{$_}=1 if length $_;
+                }
+                close $fh;
+            }
+        } elsif (($ENV{'SLURM_JOB_NUM_NODES'} // '') =~ /^(\d+)$/) {
+            $h{$_}=1 for (1..$1);
+        }
+        $nnodes = scalar keys %h;
+    }
+    my $gpn = $ngpu;
+    if (($ENV{'CADO_BWC_GPUS_PER_NODE'} // '') =~ /^(\d+)$/ && $want) {
+        $gpn = $1;
+        $ngpu = $gpn if !$ngpu;
+    }
+    if ($gpu eq '1' && !$ngpu) {
+        die "gpu=1 but no usable GPU (or no cuda matmul backend in this build)\n";
+    }
+    if ($want && $ngpu) {
+        my $asked = $param->{'thr'};
+        $param->{'mm_impl'} = 'cuda';
+        my $jobs = 1;
+        $jobs *= $_ for (split /x/, $param->{'mpi'});
+        if ($jobs == 1 && $nnodes > 1 && $gpn >= 1 && $mpiexec ne '') {
+            # several nodes: a job per GPU on each (bwc.pl maps the jobs
+            # by node, each takes the GPU of its local rank)
+            $param->{'mpi'} = $nnodes * $gpn;
+            $param->{'thr'} = 1;
+        } elsif ($jobs == 1 && $ngpu > 1 && $mpiexec ne '') {
+            # MPI build: one job per GPU, so that the vectors stay on
+            # the GPUs (exchanges through NCCL)
+            $param->{'mpi'} = $ngpu;
+            $param->{'thr'} = 1;
+        } else {
+            # one thread per GPU (vectors on the host) without MPI
+            $param->{'thr'} = $jobs > 1 ? 1 : $ngpu;
+        }
+        if ($param->{'lingen_thr'} eq '1x1') {
+            $param->{'lingen_thr'} = $asked;
+        }
+        # not for small matrices: bwc needs well over m+n rows (prep
+        # looks for start vectors of full rank, and loops forever when
+        # there are fewer rows than that -- a 140-row matrix of the c40
+        # QS test hung with m=n=128). The row count is that of the
+        # .rw.bin file that replay writes (4 bytes a row), when there is
+        # one.
+        my $small = 0;
+        if (defined(my $mtx = $param->{'matrix'})) {
+            (my $mrw = $mtx) =~ s/(\.(?:bin|txt))$/.rw$1/;
+            if ($mrw ne $mtx && -f $mrw) {
+                my $nr = (stat $mrw)[7] / 4;
+                $small = 1 if $nr < 16 * 2 * $gpu_block;
+            }
+        }
+        if (defined($param->{'m'}) && defined($param->{'n'})
+            && $param->{'m'} == 64 && $param->{'n'} == 64
+            && !defined($param->{'simd'}) && $gpu_block > 64 && !$small)
+        {
+            $param->{'m'} = $param->{'n'} = $param->{'simd'} = $gpu_block;
+        }
+        print STDERR "## GPU: " . ($nnodes > 1 ? "$gpn device(s) per node, $nnodes nodes" : "$ngpu device(s)")
+            . "; mm_impl=cuda mpi=$param->{'mpi'} thr=$param->{'thr'}"
+            . " lingen_thr=$param->{'lingen_thr'}"
+            . (defined($param->{'m'}) ? " m=$param->{'m'} n=$param->{'n'}" : "")
+            . (defined($param->{'simd'}) ? " simd=$param->{'simd'}" : "")
+            . "\n";
+    }
+}
+# }}}
 
 
 # }}}
@@ -2478,9 +2598,16 @@ sub task_cleanup {
         my $nsols = $2-$1;
         task_common_run('cleanup', "--ncols", $nsols, "--out", $wfile, @x);
     }
-    if (scalar @todo == 1 && (!-f"$wdir/W" || ((stat "$wdir/W")[7] lt (stat "$wdir/W.sols$solutions[0]")[7]))) {
-        print STDERR "## Providing $wdir/W as an alias to $wdir/W.sols$solutions[0]\n";
-        symlink "W.sols$solutions[0]", "$wdir/W";
+    # W is the first block of $splitwidth solutions (with simd=128,
+    # solutions=0-128 gives W.sols0-64 and W.sols64-128).
+    my ($s0) = $solutions[0] =~ /^(\d+)-/;
+    my $first = "$s0-" . ($s0 + $splitwidth);
+    if (-f "$wdir/W.sols$first") {
+        if (!-f"$wdir/W" || ((stat "$wdir/W")[7] lt (stat "$wdir/W.sols$first")[7])) {
+            print STDERR "## Providing $wdir/W as an alias to $wdir/W.sols$first\n";
+            unlink "$wdir/W" if -l "$wdir/W";
+            symlink "W.sols$first", "$wdir/W";
+        }
     }
 }
 # }}}

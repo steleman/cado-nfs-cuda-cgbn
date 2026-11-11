@@ -16,6 +16,16 @@ extern "C" {
 
 extern double get_alpha (mpz_poly_srcptr f, unsigned long B);
 
+/* An optional, per-thread source of root counts for get_alpha: given f
+ * and B, it returns NULL, or an array whose k-th entry is the number of
+ * distinct roots of f modulo the k-th prime <= B (2, 3, 5, ...). get_alpha
+ * then uses these counts where it would count the roots itself (primes
+ * whose square does not divide disc(f)); nothing else changes. Used by
+ * polyselect_ropt to count roots on the GPU. NULL removes the source. */
+typedef const unsigned short * (*alpha_rootcount_fn) (mpz_poly_srcptr f,
+        unsigned long B, void * arg);
+extern void set_alpha_rootcount_source (alpha_rootcount_fn fn, void * arg);
+
 extern double get_alpha_projective (mpz_poly_srcptr f, unsigned long B);
 
 extern double get_alpha_affine_p(mpz_poly_srcptr f, unsigned long p,

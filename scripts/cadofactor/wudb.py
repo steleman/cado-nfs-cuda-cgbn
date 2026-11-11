@@ -22,6 +22,8 @@
 #     warn about files in upload/ which are not listed in DB
 
 
+import os
+import threading
 import sys
 
 import collections
@@ -376,14 +378,54 @@ class WuAccess(object):
                                           # cursor is implicitly added
                                           d)
 
-    def assign(self, clientid, commit=True, timeout_hint=None):
+    # the host of each client that said it (cado-nfs-client.py sends it
+    # with its requests), for the per-host limit below
+    _client_host = {}
+    _client_host_lock = threading.Lock()
+
+    def assign(self, clientid, commit=True, timeout_hint=None,
+               host=None, ngpu=None):
         """ Finds an available workunit and assigns it to clientid.
             Returns workunit object, or None if no available
             workunit exists """
 
+        # With the GPU siever, cado-nfs.py runs one sieving workunit per
+        # GPU at a time (each las uses the whole machine's share of
+        # threads), see toplevel.py. The limit is per host: a client that
+        # says its host and number of GPUs (cado-nfs-client.py) gets a
+        # sieving workunit only while its host's clients hold fewer than
+        # max(1, ngpu) of them; one that does not (an older client) counts
+        # against the global limit, the server's number of GPUs. A
+        # global limit for everybody throttled a cluster to the server's
+        # GPUs.
+        limit = int(os.environ.get("CADO_SIEVE_WU_LIMIT", "0") or 0)
+        if host is not None:
+            with WuAccess._client_host_lock:
+                WuAccess._client_host[clientid] = host
+        hosts = None
+        if limit > 0 and host is not None:
+            with WuAccess._client_host_lock:
+                hosts = dict(WuAccess._client_host)
+            limit = max(1, ngpu) if ngpu is not None else limit
+
         def transaction(cursor):
-            r = self.mapper.table.where(cursor, limit=1,
-                                        eq={"status": WuStatus.AVAILABLE})
+            if limit > 0:
+                r = self.mapper.table.where(cursor,
+                                            eq={"status": WuStatus.AVAILABLE})
+                if len(r) and any("_sieving_" in x["wuid"] for x in r):
+                    a = self.mapper.table.where(
+                        cursor, eq={"status": WuStatus.ASSIGNED})
+                    if hosts is not None:
+                        nsieve = sum(1 for x in a if "_sieving_" in x["wuid"]
+                                     and hosts.get(x["assignedclient"]) == host)
+                    else:
+                        nsieve = sum(1 for x in a if "_sieving_" in x["wuid"])
+                    if nsieve >= limit:
+                        r = [x for x in r if "_sieving_" not in x["wuid"]]
+                r = r[:1]
+            else:
+                r = self.mapper.table.where(cursor, limit=1,
+                                            eq={"status": WuStatus.AVAILABLE})
 
             # This alternative "priority" stuff is the root cause for the
             # server taking time to hand out WUs when the count of

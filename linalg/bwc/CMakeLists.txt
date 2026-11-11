@@ -321,6 +321,15 @@ if(ENABLE_SHARED)
     install(TARGETS matmul_common DESTINATION ${LIBSUFFIX}/linalg/bwc)
 endif()
 
+if(HAVE_CUDA)
+    # matmul_top's mmt_cuda calls the kernels' C interface
+    target_link_libraries(bwc_base PUBLIC bwc_cuda_kernels)
+endif()
+if(HAVE_NCCL)
+    target_include_directories(bwc_base PUBLIC ${NCCL_INCLUDE_DIR})
+    target_link_libraries(bwc_base PUBLIC ${NCCL_LIBRARY} CUDA::cudart)
+endif()
+
 # matmul-heatmap.cpp sits in matmul_common because both sides need it:
 # the implementation that collects the blocks, and matmul_top, which
 # collates the blocks of the whole mpi/thread grid.
@@ -332,6 +341,20 @@ set(matmul_basicp_sources   matmul-basicp.cpp)
 set(matmul_zone_sources   matmul-zone.cpp)
 set(matmul_sliced_sources   matmul-sliced.cpp)
 set(matmul_bucket_sources   matmul-bucket.cpp)
+set(matmul_cuda_sources     matmul-cuda.cpp)
+
+if(HAVE_CUDA)
+    # The kernels, shared by all the GF(2) widths
+    add_library(bwc_cuda_kernels ${CADO_SHARED} matmul-cuda-kernels.cu)
+    set_property(TARGET bwc_cuda_kernels PROPERTY POSITION_INDEPENDENT_CODE ON)
+    set_property(TARGET bwc_cuda_kernels PROPERTY CUDA_RUNTIME_LIBRARY Shared)
+    target_link_libraries(bwc_cuda_kernels PUBLIC CUDA::cudart)
+    if(ENABLE_SHARED)
+        install(TARGETS bwc_cuda_kernels DESTINATION ${LIBSUFFIX}/linalg/bwc)
+    endif()
+    list(APPEND BWC_GF2_MATMUL_BACKENDS cuda)
+    list(REMOVE_DUPLICATES BWC_GF2_MATMUL_BACKENDS)
+endif()
 
 
 
@@ -364,6 +387,9 @@ macro(CONFIGURE_MATMUL_LIB v i)
 
         add_library(matmul_${v}_${i} ${CADO_SHARED} ${sources})
         target_link_libraries(matmul_${v}_${i} PUBLIC matmul_common)
+        if("${i}" STREQUAL "cuda")
+            target_link_libraries(matmul_${v}_${i} PUBLIC bwc_cuda_kernels)
+        endif()
         mark_targets_as_mpi(matmul_${v}_${i})
         cado_apply_pch(matmul_${v}_${i})
         set_property(TARGET matmul_${v}_${i}
@@ -473,6 +499,13 @@ endif()
 # This **MUST** match the #define in gf2x/fft/gf2x-cantor-fft.h
 set_property(SOURCE lingen_qcode_binary.cpp
     APPEND PROPERTY COMPILE_DEFINITIONS GF2X_CANTOR_BASE_FIELD_SIZE=128)
+
+if(HAVE_CUDA)
+    # tells bwc.pl whether there is a GPU to use
+    add_executable(cuda_devices cuda_devices.cpp)
+    target_link_libraries(cuda_devices PRIVATE CUDA::cudart)
+    install(TARGETS cuda_devices RUNTIME DESTINATION ${LIBSUFFIX}/linalg/bwc)
+endif()
 
 add_executable(cleanup cleanup.cpp)
 cado_apply_pch(cleanup)

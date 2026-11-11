@@ -15,6 +15,10 @@
 #include <vector>
 #include <memory>
 #include <sstream>
+#include <thread>
+#include <algorithm>
+#include <cstring>
+#include <sched.h>
 
 #include <strings.h>
 #include <regex.h>
@@ -24,6 +28,9 @@
 #include "hwloc-aux.hpp"
 #endif
 #include "las-parallel.hpp"
+#ifdef HAVE_CUDA
+#include "las-sieve-gpu-kernels.h"
+#endif
 
 #include "misc.h"
 #include "utils_cxx.hpp"
@@ -171,7 +178,11 @@ struct las_parallel_desc::helper {
              * indicator of this situation, and we must make sure
              * that we return sane defaults in all cases. It's quite
              * ugly and should be reworked.
+             * (depth was left as hwloc's: on a hybrid processor such as
+             * a 13900K, with cores of 2 PUs and of 1, -t Machine,16,2
+             * then failed in BUG() looking for 16 cpusets of 2 PUs.)
              */
+            depth = 0;
             return;
         }
 
@@ -209,6 +220,36 @@ struct las_parallel_desc::helper {
             return;
         }
         if (desc == "single") { desc = "machine,1,pu"; return; }
+        if (desc == "gpu-auto") {
+            /* las with the GPU siever, one per GPU of the node (as
+             * cado-nfs.py runs them): this process's share of the CPUs
+             * that it may use, in subjobs of 2 threads (one subjob per 2
+             * threads was best, see sieve/README.gpu.md). Each node
+             * decides for itself, so that the nodes of a cluster need
+             * not be alike. Without a GPU: "auto". */
+            int ngpu = 0;
+#ifdef HAVE_CUDA
+            char const * e = getenv("CADO_LAS_GPU_SIEVE");
+            /* off as las reads it (atoi: "0", "off", "no") */
+            if (!(e && atoi(e) == 0))
+                ngpu = lsg_device_count();
+#endif
+            if (ngpu <= 0) {
+                desc = default_placement_with_auto;
+                return;
+            }
+            int ncpu = 0;
+            cpu_set_t set;
+            if (sched_getaffinity(0, sizeof(set), &set) == 0)
+                ncpu = CPU_COUNT(&set);
+            if (ncpu <= 0)
+                ncpu = (int) std::thread::hardware_concurrency();
+            int const per_gpu = std::max(4, ncpu / ngpu);
+            std::ostringstream os;
+            os << "Machine," << std::max(1, per_gpu / 2) << ",2";
+            desc = os.str();
+            return;
+        }
         if (desc == "auto") { desc = default_placement_with_auto; return; }
         if (desc == "auto,no-replicate") { desc = default_placement_with_auto; desc += ",no-replicate"; return; }
         if (desc.substr(0,7) == "single-") {
@@ -347,6 +388,8 @@ struct las_parallel_desc::helper {
        return std::get<1>(x) * std::get<2>(x);
    }/*}}}*/
    std::string textual_description_for_binding(int n) const {/*{{{*/
+       if (!depth)     /* asymmetric topology: no hierarchy to describe */
+           return std::to_string(n) + " PUs";
        int k, child_size, part_size;
        ASSERT(n <= number_of(-1, 0));
        std::tie(k, child_size, part_size) = flat_to_hierarchical(n);
@@ -448,7 +491,10 @@ struct las_parallel_desc::helper {
                    total_ram() >> 30, jobram);
        }
        /* This means subjobs can't be smaller than this: */
-       computed_min_pu_fit = iceildiv(number_of(-1, 0), how_many);
+       /* number_of() needs depth, which is 0 on an asymmetric topology */
+       int const npu = depth ? number_of(-1, 0)
+           : std::max(1, hwloc_get_nbobjs_by_type(topology, HWLOC_OBJ_PU));
+       computed_min_pu_fit = iceildiv(npu, how_many);
        std::string const s = textual_description_for_binding(computed_min_pu_fit);
        std::ostringstream os;
        os  << "# Given our estimate of "
@@ -559,8 +605,10 @@ struct las_parallel_desc::helper {
        if (nobind)
            return 0;
        if (!depth) {
-           if (strcasecmp(specifier.c_str(), "machine") != 0)
-               throw bad_specification("hwloc detected asymmetric topology, the only accepted memory binding specifier is \"machine\"");
+           /* asymmetric topology: no binding is set at all (see
+            * helper()), so whatever binding was asked for is moot.
+            * Rejecting it made -t auto fail on hybrid processors (and
+            * descent.py, which uses it, retry forever). */
            return 0;
        }
        int binding_size = 0;
@@ -668,10 +716,34 @@ struct las_parallel_desc::helper {
        return 0;
 #endif
    }/*}}}*/
+#ifdef HAVE_HWLOC
+   /* with depth == 0 (asymmetric topology, see helper()): the number of
+    * objects of the named kind in the whole machine; for "fit", the
+    * number of jobs of computed_min_pu_fit PUs that fit */
+   int flat_count(std::string const & name) const {/*{{{*/
+       int const npu = std::max(1, hwloc_get_nbobjs_by_type(topology, HWLOC_OBJ_PU));
+       if (strcasecmp(name.c_str(), "fit") == 0) {
+           if (computed_min_pu_fit < 0) throw needs_job_ram();
+           return std::max(1, npu / std::max(1, computed_min_pu_fit));
+       }
+       if (name.find_first_of("*/") != std::string::npos)
+           throw bad_specification("Only binding specifiers allow multipliers");
+       int const argdepth = hwloc_aux_get_depth_from_string(topology, name.c_str());
+       if (argdepth < 0)
+           throw bad_specification(name, " is invalid");
+       return std::max(1, (int) hwloc_get_nbobjs_by_depth(topology, argdepth));
+   }/*}}}*/
+#endif
    int interpret_njobs_specifier() {/*{{{*/
        if (parse_number(jobs_within_cpu_binding_string, nsubjobs_per_cpu_binding_zone))
            return nsubjobs_per_cpu_binding_zone;
 #ifdef HAVE_HWLOC
+       if (!depth) {
+           /* asymmetric topology, no binding: as many jobs as there are
+            * such objects in the machine (number_of() needs depth) */
+           nsubjobs_per_cpu_binding_zone = flat_count(jobs_within_cpu_binding_string);
+           return nsubjobs_per_cpu_binding_zone;
+       }
        int objsize;
        if (strcasecmp(jobs_within_cpu_binding_string.c_str(), "fit") == 0) {
            if (computed_min_pu_fit < 0) throw needs_job_ram();
@@ -716,6 +788,13 @@ struct las_parallel_desc::helper {
        if (parse_number(threads_per_job_string, nthreads_per_subjob))
            return nthreads_per_subjob;
 #ifdef HAVE_HWLOC
+       if (!depth) {
+           /* asymmetric topology, no binding: these objects shared out
+            * among the jobs */
+           nthreads_per_subjob = std::max(1, flat_count(threads_per_job_string)
+                   / std::max(1, nsubjobs_per_cpu_binding_zone));
+           return nthreads_per_subjob;
+       }
        int objsize;
        int const argdepth = hwloc_aux_get_depth_from_string(topology, threads_per_job_string.c_str());
        if (argdepth < 0)

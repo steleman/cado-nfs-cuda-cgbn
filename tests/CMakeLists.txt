@@ -123,7 +123,14 @@ if(pz IN_LIST BWC_GFP_ARITHMETIC_BACKENDS)
         ENVIRONMENT OMP_DYNAMIC=true OMP_NUM_THREADS=16 OMP_THREAD_LIMIT=16
         TIMEOUT 360
         SHA1_ON_REGEXP_LINES "^[0-9 ]*$"
-        EXPECT_SHA1 c427998c92b82ce31b71f50d340b7ee1f9f164e2
+        # The log is in the base the run picks (logbase), which follows
+        # from the polynomial. Since polyselect_ropt sieves the arrays
+        # shorter than its L1 block (they were left unsieved), it picks
+        # another polynomial here: logbase 1938521719612383271900352846139,
+        # log(target) = 13999683088052631540671415 mod ell, which checks
+        # (logbase^(log (p-1)/ell) = target^((p-1)/ell) mod p). The old
+        # checksum was c427998c92b82ce31b71f50d340b7ee1f9f164e2.
+        EXPECT_SHA1 f5ab7ea6d3f74bda4543a188b2fa3c6fdcc63632
     )
     # The following case was hitting the bug #21707
     set(full_p30_JL_params

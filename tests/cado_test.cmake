@@ -324,6 +324,16 @@ macro(cado_epilogue_create_test)
             ${CMAKE_COMMAND}
             --build ${CMAKE_BINARY_DIR}
             --target ${TEST_NAME}_dependencies)
+        # Two of these that build the same target must not run at the
+        # same time: one would relink it while a test that the other one
+        # unblocked runs it (seen with the four test_bblas_level* tests,
+        # which share the test_bblas executable, under ctest -j).
+        set(builddep_locks)
+        foreach(t ${TARGET_DEPENDENCIES})
+            list(APPEND builddep_locks cado_build_${t})
+        endforeach()
+        set_tests_properties(builddep_${TEST_NAME} PROPERTIES
+            RESOURCE_LOCK "${builddep_locks}")
         list(APPEND TEST_DEPENDENCIES builddep_${TEST_NAME})
     endif()
 

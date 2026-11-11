@@ -1264,6 +1264,25 @@ namespace cado::filter_io_details {
                 ASSERT(x[slot & (SIZE_BUF_REL-1)].load() == level);
             }
         }
+        /* {{{ ::complete_range() (for ::complete_batch())
+         * The relations of absolute indices [first, first+count) are done
+         * at this level: mark them, then move last_completed over every
+         * slot, up to the end of this range, that is done at this level
+         * (by us or by another thread of the level). */
+        void complete_range(csize_t & last_completed, size_t first,
+                size_t count, int level) {
+            for (size_t i = first; i < first + count; i++) {
+                ASSERT(x[i & (SIZE_BUF_REL-1)].load() == (int8_t) (level-1));
+                x[i & (SIZE_BUF_REL-1)].increment();
+            }
+            size_t c = last_completed.load();
+            for ( ; c < first + count ; c++) {
+                if (x[c & (SIZE_BUF_REL-1)].load() < level)
+                    break;
+            }
+            last_completed.store(c);
+        }
+        /* }}} */
     };
 
     template<>
@@ -1455,6 +1474,77 @@ namespace cado::filter_io_details {
         }
         /*}}}*/
 
+        /* {{{ schedule_batch / complete_batch
+         *
+         * The same as schedule() and complete(), for up to maxcount
+         * consecutive relations at once: one lock and one wake-up per
+         * batch instead of per relation. schedule_batch returns the
+         * number of relations (0 when the stream has ended, as schedule()
+         * returning nullptr) and their first absolute index; they are
+         * at rels[(first + i) & (SIZE_BUF_REL - 1)], with no wrap-around.
+         * Only for locking layers that allow concurrent threads per
+         * level (the status table tracks the levels slot by slot). */
+        static constexpr size_t batch_size = 64;
+        size_t schedule_batch(size_t k, size_t maxcount, size_t & first)
+            requires (locking_layer::max_supported_concurrent > 1)
+        {
+            size_t const prev = k ? (k-1) : (n-1);
+            size_t s;
+            size_t const a = k ? 0 : SIZE_BUF_REL;
+            locking_layer::lock(m + prev);
+            while((s=scheduled[k].load()) == a + completed[prev].load()) {
+                locking_layer::wait(bored + prev, m + prev);
+            }
+            size_t avail;
+            if (UNLIKELY(completed[prev].load() == SIZE_MAX)) {
+                /* the previous level has ended: what it scheduled is all
+                 * there is (see schedule()) */
+                avail = scheduled[prev].load() - s;
+                if (avail == 0) {
+                    locking_layer::unlock(m + prev);
+                    locking_layer::lock(m + k);
+                    status.catchup(completed[k], s, k);
+                    active[k]--;
+                    locking_layer::signal_broadcast(bored + k);
+                    locking_layer::unlock(m + k);
+                    return 0;
+                }
+            } else {
+                avail = a + completed[prev].load() - s;
+            }
+            size_t cnt = std::min(avail, maxcount);
+            /* no wrap-around in the ring */
+            cnt = std::min(cnt, SIZE_BUF_REL - (s & (SIZE_BUF_REL - 1)));
+            for (size_t i = 0; i < cnt; i++) {
+                scheduled[k].increment();
+                status.update_shouldbealreadyok(s + i, k-1);
+            }
+            locking_layer::unlock(m + prev);
+            first = s;
+            return cnt;
+        }
+
+        /* The producer (level 0) may take back the slots it scheduled
+         * last and did not use (it is the only thread at level 0). */
+        void unschedule_tail(size_t count)
+            requires (locking_layer::max_supported_concurrent > 1)
+        {
+            locking_layer::lock(m + n - 1);
+            scheduled[0].store(scheduled[0].load() - count);
+            locking_layer::unlock(m + n - 1);
+        }
+
+        void complete_batch(int k, size_t first, size_t count)
+            requires (locking_layer::max_supported_concurrent > 1)
+        {
+            if (!count) return;
+            locking_layer::lock(m + k);
+            status.complete_range(completed[k], first, count, k);
+            locking_layer::signal_broadcast(bored + k);
+            locking_layer::unlock(m + k);
+        }
+        /* }}} */
+
         void complete(int k, relation_type const * rel) /* {{{ */
         {
             // coverity[result_independent_of_operands]
@@ -1541,10 +1631,19 @@ namespace cado::filter_io_details {
                 for(auto t = number_of_threads(fk); t-- ; ) {
                     pool.emplace_back([&, stats]() {
                             enter(k);
-                            relation_type * slot;
-                            for( ; (slot = schedule(k)) != nullptr ; ) {
-                                fk(*slot);
-                                complete(k, slot);
+                            if constexpr (locking_layer::max_supported_concurrent > 1) {
+                                size_t first, cnt;
+                                while ((cnt = schedule_batch(k, batch_size, first))) {
+                                    for (size_t i = 0; i < cnt; i++)
+                                        fk(rels[(first + i) & (SIZE_BUF_REL - 1)]);
+                                    complete_batch(k, first, cnt);
+                                }
+                            } else {
+                                relation_type * slot;
+                                for( ; (slot = schedule(k)) != nullptr ; ) {
+                                    fk(*slot);
+                                    complete(k, slot);
+                                }
                             }
                             leave(k);
                             if (stats)
@@ -1627,6 +1726,7 @@ namespace cado::filter_io_details {
     void configure(cxx_param_list &);
     void interpret_parameters(cxx_param_list &);
     extern bool filter_rels_force_posix_threads_is_set();
+    extern size_t filter_rels_parse_threads();
 } /* namespace cado::filter_io_details */
 
 
@@ -1677,12 +1777,78 @@ struct filter_rels_obj {
         return backend_call(is, std::forward<Args>(args)...);
     }
 
+    /* When the relations are parsed by threads of their own (a first
+     * processing level, see filter_rels), the producer only cuts the
+     * input into lines and copies each into the text of its slot. */
+    struct split_parse {
+        std::unique_ptr<std::string[]> text;
+        std::unique_ptr<uint64_t[]> relnum;
+        relation_type const * base = nullptr;
+        split_parse()
+            : text(std::make_unique<std::string[]>(SIZE_BUF_REL))
+            , relnum(std::make_unique<uint64_t[]>(SIZE_BUF_REL))
+        {}
+    };
+
     template<typename InputDescriptionType, typename... Functions>
         requires (cado::filter_io_details::all_functions_are_invocable_v<relation_type, Functions...> && cado::filter_io_details::is_locking_layer_v<locking_layer>)
     size_t backend_call(
             InputDescriptionType input_files,
             std::vector<bool> const * active,
             timingstats_dict_ptr tstats,
+            Functions&& ...FF) const
+    {
+        return backend_call_impl(input_files, active, tstats, nullptr,
+                std::forward<Functions>(FF)...);
+    }
+
+    /* the same, with a parsing level of nthreads threads in front; the
+     * input descriptions as operator() takes them */
+    template<typename... Args>
+    size_t split_call(std::vector<std::string> const & input_files, Args&& ...args)
+    {
+        if (input_files.empty())
+            return 0;
+        return backend_call_split(input_files, std::forward<Args>(args)...);
+    }
+    template<typename... Args>
+    size_t split_call(std::string const & f, Args&& ...args)
+    {
+        const std::vector<std::string> fs = {f};
+        return backend_call_split(fs, std::forward<Args>(args)...);
+    }
+    template<typename... Args>
+    size_t split_call(std::istream & is, Args&& ...args)
+    {
+        return backend_call_split(is, std::forward<Args>(args)...);
+    }
+
+    template<typename InputDescriptionType, typename... Functions>
+    size_t backend_call_split(
+            InputDescriptionType input_files,
+            std::vector<bool> const * active,
+            timingstats_dict_ptr tstats,
+            size_t nthreads,
+            Functions&& ...FF) const
+        requires (locking_layer::max_supported_concurrent > 1)
+    {
+        auto sp = std::make_shared<split_parse>();
+        auto parse = cado::filter_io_details::multithreaded_call(nthreads,
+                [sp](relation_type & rel) {
+                    size_t const i = &rel - sp->base;
+                    cado::filter_io_details::parse_helper(rel, sp->relnum[i],
+                            sp->text[i].c_str());
+                });
+        return backend_call_impl(input_files, active, tstats, sp.get(),
+                std::move(parse), std::forward<Functions>(FF)...);
+    }
+
+    template<typename InputDescriptionType, typename... Functions>
+    size_t backend_call_impl(
+            InputDescriptionType input_files,
+            std::vector<bool> const * active,
+            timingstats_dict_ptr tstats,
+            split_parse * sp,
             Functions&& ...FF) const
     {
         constexpr size_t N = sizeof...(FF);
@@ -1731,6 +1897,8 @@ struct filter_rels_obj {
          * which instantiates and calls us.
          */
 
+        if (sp) sp->base = inflight.rels.get();
+
         std::vector<std::jthread> consumers;
         consumers.reserve(number_of_consumers);
         inflight.template spawn_threads<0, Functions...>(
@@ -1750,6 +1918,8 @@ struct filter_rels_obj {
                     "read rels", "rels");
 
         inflight.enter(0);
+        /* the producer's current batch of slots (see schedule_batch) */
+        size_t b_first = 0, b_count = 0, b_used = 0;
         for(size_t avail_seen = 0 ; ; ) {
             {
                 std::unique_lock ux(rb.mx);
@@ -1767,25 +1937,55 @@ struct filter_rels_obj {
              * produced. As long as we succeed reading complete lines, we
              * consume them, and feed the second pipe.
              */
+            /* The lines are found at increasing offsets from the read
+             * head, and the bytes are handed back to the reader thread
+             * every 64 KB (rather than line by line: that takes a lock). */
             int nl;
-            for(size_t avail_offset = 0; avail_offset < avail_seen && (nl = rb.strchr('\n', 0)) >= 0 ; ) {
+            size_t off = 0;
+            for( ; off < avail_seen && (nl = rb.strchr('\n', off)) >= 0 ; ) {
                 /* skip comments and blank lines */
-                if (*rb.begin() != '#' && *rb.begin() != '\n') {
+                unsigned char const c0 = *rb.at(off);
+                if (c0 != '#' && c0 != '\n') {
                     uint64_t const relnum = nrels++;
                     if (!active || (*active)[relnum]) {
-                        auto * slot = inflight.schedule(0);
-                        ASSERT_ALWAYS(slot);
-                        cado::filter_io_details::parse_helper(*slot, relnum, rb.begin());
-                        inflight.complete(0, slot);
+                        if constexpr (locking_layer::max_supported_concurrent > 1) {
+                            /* slots are taken and handed over in batches */
+                            if (b_used == b_count) {
+                                inflight.complete_batch(0, b_first, b_used);
+                                b_count = inflight.schedule_batch(0,
+                                        inflight_t::batch_size, b_first);
+                                b_used = 0;
+                                ASSERT_ALWAYS(b_count);
+                            }
+                            size_t const k = (b_first + b_used++) & (SIZE_BUF_REL - 1);
+                            if (sp) {
+                                /* the line and its newline, for the parsers */
+                                std::string & t = sp->text[k];
+                                t.resize(nl - off + 1);
+                                rb.copy_out(off, nl - off + 1, t.data());
+                                sp->relnum[k] = relnum;
+                            } else {
+                                cado::filter_io_details::parse_helper(
+                                        inflight.rels[k], relnum, rb.at(off));
+                            }
+                        } else {
+                            auto * slot = inflight.schedule(0);
+                            ASSERT_ALWAYS(slot);
+                            cado::filter_io_details::parse_helper(*slot, relnum, rb.at(off));
+                            inflight.complete(0, slot);
+                        }
                         nactive++;
                     }
                 }
                 /* skip the newline byte as well */
-                nl++;
-                nB += nl;
-                rb.skip_get(nl);
-                avail_seen -= nl;
-                avail_offset += nl;
+                size_t const len = nl - off + 1;
+                nB += len;
+                off += len;
+                if (off >= 65536) {
+                    rb.skip_get(off);
+                    avail_seen -= off;
+                    off = 0;
+                }
                 if (stats_test_progress(infostats))
                 {
                     if (!active)
@@ -1794,6 +1994,15 @@ struct filter_rels_obj {
                         stats_print_progress (infostats, nactive, nrels, nB, 0);
                 }
             }
+            if (off) {
+                rb.skip_get(off);
+                avail_seen -= off;
+            }
+        }
+        if constexpr (locking_layer::max_supported_concurrent > 1) {
+            /* the last batch: give back what was not used, hand over the rest */
+            inflight.unschedule_tail(b_count - b_used);
+            inflight.complete_batch(0, b_first, b_used);
         }
         inflight.drain();
         inflight.leave(0);
@@ -1827,6 +2036,17 @@ size_t filter_rels(
 {
     using cado::filter_io_details::number_of_threads;
     const size_t number_of_consumers = std::max({number_of_threads(FF)...});
+    /* Parsing the relations in the producer thread made it the slowest
+     * thread of dup2 and purge: they are parsed by threads of their own
+     * (CADO_FILTER_PARSE_THREADS, default 4; 1 for the old way). */
+    const size_t parse_threads = cado::filter_io_details::filter_rels_parse_threads();
+    if (parse_threads > 1) {
+        using L = cado::filter_io_details::ifb_locking_posix;
+        return filter_rels_obj<L, relation_type>().split_call(
+                std::forward<InputDescriptionType>(input_description),
+                active, tstats, parse_threads,
+                std::forward<Functions>(FF)...);
+    }
     if (cado::filter_io_details::filter_rels_force_posix_threads_is_set() || number_of_consumers > cado::filter_io_details::ifb_locking_lightweight::max_supported_concurrent) {
         using L = cado::filter_io_details::ifb_locking_posix;
         return filter_rels_obj<L, relation_type>()(

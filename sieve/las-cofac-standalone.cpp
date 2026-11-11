@@ -8,6 +8,11 @@
 #include <array>
 #include <mutex>
 #include <vector>
+#include <string>
+#include <algorithm>
+#include <iterator>
+
+#include "fmt/format.h"
 
 #include <gmp.h>
 
@@ -27,6 +32,7 @@
 #include "las-where-am-i-proxy.hpp"
 #include "lock_guarded_container.hpp"
 #include "relation.hpp"
+#include "macros.h"
 
 struct qlattice_basis; // IWYU pragma: keep
 
@@ -138,6 +144,51 @@ relation cofac_standalone::get_relation(special_q const & doing) const {/*{{{*/
 
     rel.compress();
     return rel;
+}/*}}}*/
+bool cofac_standalone::format_relation(special_q const & doing MAYBE_UNUSED, std::string & out MAYBE_UNUSED) const {/*{{{*/
+#ifdef SUPPORT_LARGE_Q
+    return false;
+#else
+    if (factors.size() != 2 || lps.size() != 2)
+        return false;
+    if (doing.side < 0 || doing.side > 1)
+        return false;
+    /* the primes of each side; relation::compress sorts them (all with
+     * r = 0) and merges equal ones into exponents, which operator<<
+     * prints again as repeats: so this is the sorted multiset */
+    std::array<std::vector<uint64_t>, 2> P;
+    for (int side = 0; side < 2; side++) {
+        auto & v = P[side];
+        v.reserve(factors[side].size() + lps[side].size() + 2);
+        v.insert(v.end(), factors[side].begin(), factors[side].end());
+        for (auto const & z : lps[side]) {
+            if (!mpz_fits_ulong_p(z))
+                return false;
+            v.push_back(mpz_get_ui(z));
+        }
+    }
+    if (doing.is_prime()) {
+        if (!mpz_fits_ulong_p(doing.p))
+            return false;
+        P[doing.side].push_back(mpz_get_ui(doing.p));
+    } else {
+        for (auto const q : doing.prime_factors)
+            P[doing.side].push_back(q);
+    }
+    auto it = std::back_inserter(out);
+    fmt::format_to(it, "{},{}", a, b);
+    for (auto & v : P) {
+        std::ranges::sort(v);
+        out += ':';
+        bool comma = false;
+        for (auto const p : v) {
+            if (comma) out += ',';
+            fmt::format_to(it, "{:x}", p);
+            comma = true;
+        }
+    }
+    return true;
+#endif
 }/*}}}*/
 void cofac_standalone::transfer_to_cofac_list(lock_guarded_container<std::list<cofac_candidate>> & L) {/*{{{*/
     std::lock_guard<std::mutex> const foo(L.mutex());

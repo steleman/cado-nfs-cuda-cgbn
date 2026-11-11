@@ -111,6 +111,9 @@
 #include "timing.h"
 #include "version_info.h"
 #include "cado_main.hpp"
+#ifdef HAVE_CUDA
+#include "characters_gpu.h"
+#endif
 #include "utils_cxx.hpp"
 
 typedef struct {
@@ -376,6 +379,100 @@ struct big_characters_data {
         res.set_zero();
     }
 
+#ifdef HAVE_CUDA
+    /* The characters of all the pairs on the GPU (characters_gpu.cu):
+     * the pairs are read first, then evaluated together. Same bits as
+     * eval_64chars (CADO_CHARACTERS_GPU_CHECK=1 compares every row).
+     * Returns false, having read nothing, if the GPU is not used. */
+    bool filter_gpu(int nthreads) {
+        using relation_type = cado::relation_building_blocks::ab_block<uint64_t, 16>;
+        const char * e = getenv("CADO_CHARACTERS_GPU");
+        if ((e && e[0] == '0') || !chg_available())
+            return false;
+        /* the polynomials of the sign characters; "2" is the rational
+         * side's sign, as 1024 + side */
+        std::vector<chg_char> gch(chars.size());
+        for (size_t i = 0; i < chars.size(); i++) {
+            gch[i].p = chars[i].p;
+            gch[i].r = chars[i].r;
+            if (chars[i].p == 0 && chars[i].r == 2)
+                gch[i].r = 1024 + cpoly.get_ratside();
+        }
+        std::vector<std::vector<uint32_t>> limbs(cpoly.nsides());
+        std::vector<std::vector<int8_t>> signs(cpoly.nsides());
+        std::vector<chg_poly> polys(cpoly.nsides());
+        for (int side = 0; side < cpoly.nsides(); side++) {
+            mpz_poly_srcptr f = cpoly[side];
+            size_t nl = 1;
+            for (int k = 0; k <= f->deg; k++)
+                nl = std::max(nl, (mpz_sizeinbase(mpz_poly_coeff_const(f, k), 2) + 31) / 32);
+            limbs[side].assign((f->deg + 1) * nl, 0);
+            signs[side].assign(f->deg + 1, 0);
+            for (int k = 0; k <= f->deg; k++) {
+                size_t cnt;
+                mpz_export(&limbs[side][k * nl], &cnt, -1, 4, 0, 0,
+                           mpz_poly_coeff_const(f, k));
+                signs[side][k] = (int8_t) mpz_sgn(mpz_poly_coeff_const(f, k));
+            }
+            polys[side] = chg_poly { f->deg, (int) nl, limbs[side].data(), signs[side].data() };
+        }
+
+        fmt::print(stderr, "Reading {} pairs from {} and computing {} characters on the GPU\n",
+                           res.nrows(), purgedname, chars.size());
+        const size_t n = res.nrows();
+        std::vector<int64_t> A(n);
+        std::vector<uint64_t> B(n);
+        std::vector<uint8_t> seen(n, 0);
+        filter_rels<relation_type>(purgedname, nullptr, nullptr,
+            cado::filter_io_details::multithreaded_call(nthreads,
+            [&](relation_type & rel) {
+                A[rel.num] = rel.a;
+                B[rel.num] = rel.b;
+                seen[rel.num] = 1;
+            }));
+        const size_t nw = chars.size() / 64;
+        std::vector<uint64_t> out(n * nw);
+        std::vector<uint8_t> bad(n);
+        if (!chg_eval(A.data(), B.data(), n, gch.data(), (int) gch.size(),
+                      polys.data(), cpoly.nsides(), out.data(), bad.data())) {
+            /* values too large for the GPU code: the CPU, from the pairs read */
+            for (size_t i = 0; i < n; i++) {
+                if (!seen[i]) continue;
+                relation_type rel;
+                rel.num = i;
+                rel.a = A[i];
+                rel.b = B[i];
+                for (size_t cg = 0; cg < chars.size(); cg += 64)
+                    res[i][cg] = eval_64chars(rel, chars.data() + cg, cpoly);
+            }
+            return true;
+        }
+        static const bool check = getenv("CADO_CHARACTERS_GPU_CHECK") != nullptr;
+        size_t ndiff = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (!seen[i]) continue;
+            if (bad[i] || check) {
+                /* the CPU reports a zero Legendre symbol (and stops) */
+                relation_type rel;
+                rel.num = i;
+                rel.a = A[i];
+                rel.b = B[i];
+                for (size_t cg = 0; cg < chars.size(); cg += 64) {
+                    const uint64_t v = eval_64chars(rel, chars.data() + cg, cpoly);
+                    ndiff += v != out[i * nw + cg / 64];
+                }
+            }
+            for (size_t cg = 0; cg < chars.size(); cg += 64)
+                res[i][cg] = out[i * nw + cg / 64];
+        }
+        if (check) {
+            fmt::print(stderr, "characters GPU check: {} words differ\n", ndiff);
+            ASSERT_ALWAYS(ndiff == 0);
+        }
+        return true;
+    }
+#endif
+
     template<typename relation_type>
     void filter(int nthreads) {
         /* For each rel, read the a,b-pair, compute the characters and
@@ -406,6 +503,9 @@ static blockmatrix big_character_matrix(
     big_characters_data B(cpoly, purgedname, chars);
     if (!largeab) {
         using relation_type = cado::relation_building_blocks::ab_block<uint64_t, 16>;
+#ifdef HAVE_CUDA
+        if (!B.filter_gpu(nthreads))
+#endif
         B.filter<relation_type>(nthreads);
     } else {
         using relation_type = cado::relation_building_blocks::ab_block<cxx_mpz, 16>;

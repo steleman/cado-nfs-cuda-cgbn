@@ -523,9 +523,18 @@ recent than 3.1.3) fixes this.
         if not self.serving_wus:
             flask.abort(410, "Distributed computation finished")
 
+        # the client's host and its number of GPUs (cado-nfs-client.py):
+        # sieving workunits are limited per host (wudb.py)
+        host = flask.request.form.get('host')
+        try:
+            ngpu = int(flask.request.form.get('ngpu', ''))
+        except ValueError:
+            ngpu = None
+
         # we might want to make the timeout dependent on the clientid.
         wu = self.get_wuaccess().assign(clientid,
-                                        timeout_hint=self.timeout_hint)
+                                        timeout_hint=self.timeout_hint,
+                                        host=host, ngpu=ngpu)
 
         if not wu:
             # This flag is to downgrade the logging level. Ugly.

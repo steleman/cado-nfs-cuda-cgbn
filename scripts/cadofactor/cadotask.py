@@ -2,6 +2,7 @@
 
 import re
 import os
+import concurrent.futures
 from math import gcd
 import abc
 import random
@@ -14,6 +15,8 @@ import logging
 import pathlib
 import socket
 import gzip
+import shutil
+import subprocess
 import heapq
 import errno
 from cadofactor import patterns, wudb, cadoprograms
@@ -1326,7 +1329,35 @@ class Task(patterns.Colleague, SimpleStatistics, HasState, DoesLogging,
     def paramnames(self):
         # Parameters that all tasks use
         return self.join_params(super().paramnames,
-                                {"name": str, "workdir": str, "run": True})
+                                {"name": str, "workdir": str, "run": True,
+                                 "compression": "auto"})
+
+    def compression_suffix(self, written_by_clients=False):
+        """ The suffix of the compressed files that this task writes: ""
+        if its gzip parameter is off; else ".zst" if tasks.compression
+        is "zst", or "auto" (the default) and zstd is installed here,
+        and ".gz" otherwise. zstd -1 makes files a little smaller than
+        gzip --fast and decompresses about 10 times faster (c120: the
+        six dup2 files, 3.45 s with gzip, 0.35 s), and filtering
+        rereads its files in every round. Files that the clients write
+        (las output) take .zst only with tasks.compression=zst: "auto"
+        cannot know whether the clients' hosts have zstd. """
+        try:
+            if not self.params.get("gzip", True):
+                return ""
+            c = str(self.params.get("compression", "auto"))
+        except AttributeError:
+            c = "auto"
+        if c == "gz":
+            return ".gz"
+        if c == "zst":
+            return ".zst"
+        if c != "auto":
+            raise ValueError("tasks.compression must be auto, gz or zst,"
+                             " not %s" % c)
+        if not written_by_clients and shutil.which("zstd"):
+            return ".zst"
+        return ".gz"
 
     @property
     def param_nodename(self):
@@ -2805,8 +2836,10 @@ class Polysel2Task(ClientServerTask,
         self.progparams[0].setdefault("Bg", float(2**self.params["lpb0"]))
         if "batch" not in self.params:
             t = self.progparams[0].get("threads", 1)
-            # batch = 5 rounded up to a multiple of t
-            self.params["batch"] = (4 // t + 1) * t
+            # one polynomial per thread of a client: with batches of
+            # 5 rounded up to a multiple of t (the old default), the 48
+            # polynomials of a c120 went to 8 of its 16 clients
+            self.params["batch"] = t
         self.poly_to_submit = None
 
     def run(self):
@@ -3635,7 +3668,8 @@ class FactorBaseTask(Task):
         if not self.has_all_outputfiles_in_state(poly):
             # Make file name for factor base/free relations file
             # We use .gzip by default, unless set to no in parameters
-            use_gz = ".gz" if self.params["gzip"] else ""
+            # the clients' las read it
+            use_gz = self.compression_suffix(written_by_clients=True)
 
             # Run command to generate factor base file
             (stdoutpath, stderrpath) = self.make_std_paths(
@@ -3827,7 +3861,7 @@ class FreeRelTask(Task):
         if "freerelfilename" not in self.state or self.have_new_input_files():
             # Make file name for factor base/free relations file
             # We use .gzip by default, unless set to no in parameters
-            use_gz = ".gz" if self.params["gzip"] else ""
+            use_gz = self.compression_suffix()
             freerelfilename = self.workdir.make_filename("freerel" + use_gz)
             renumberfilename = self.workdir.make_filename("renumber" + use_gz)
             (stdoutpath, stderrpath) = self.make_std_paths(
@@ -4058,7 +4092,7 @@ class SievingTask(ClientServerTask, DoesImport, FilesCreator, HasStatistics):
             q1 = q1 - (q1 % qrange)
             assert q1 > q0
             # We use .gzip by default, unless set to no in parameters
-            use_gz = ".gz" if self.params["gzip"] else ""
+            use_gz = self.compression_suffix(written_by_clients=True)
             outputfilename = \
                 self.workdir.make_filename("%d-%d%s" % (q0, q1, use_gz))
             self.check_files_exist([outputfilename], "output",
@@ -4188,6 +4222,9 @@ class SievingTask(ClientServerTask, DoesImport, FilesCreator, HasStatistics):
         try:
             if ext == ".gz":
                 f = gzip.open(filename, "rb")
+            elif ext == ".zst":
+                f = subprocess.Popen(["zstd", "-dcq", filename],
+                                     stdout=subprocess.PIPE).stdout
             else:
                 f = open(filename, "rb")
         except (OSError, IOError) as e:
@@ -4438,6 +4475,10 @@ class Duplicates1Task(Task, FilesCreator, HasStatistics):
                     subdir.mkdir(parent=True)
                 run_counter = self.state.get("run_counter", 0)
                 prefix = "dup1.%s" % run_counter
+                # dup2 and purge reread these in every round: the
+                # compression of the filtering files (compression_suffix)
+                sfx = self.compression_suffix()
+                outfmt = {"outfmt": sfx} if sfx else {}
                 (stdoutpath, stderrpath) = self.make_std_paths(
                     cadoprograms.Duplicates1.name)
 
@@ -4445,6 +4486,7 @@ class Duplicates1Task(Task, FilesCreator, HasStatistics):
                     p = cadoprograms.Duplicates1(*newfiles,
                                                  prefix=prefix,
                                                  out=outputdir,
+                                                 **outfmt,
                                                  stdout=str(stdoutpath),
                                                  stderr=str(stderrpath),
                                                  **self.progparams[0])
@@ -4453,6 +4495,7 @@ class Duplicates1Task(Task, FilesCreator, HasStatistics):
                     p = cadoprograms.Duplicates1(filelist=filelistname,
                                                  prefix=prefix,
                                                  out=outputdir,
+                                                 **outfmt,
                                                  stdout=str(stdoutpath),
                                                  stderr=str(stderrpath),
                                                  **self.progparams[0])
@@ -4604,6 +4647,21 @@ class Duplicates2Task(Task, FilesCreator, HasStatistics):
         super().run()
 
         input_nrel = 0
+        # The slices are independent: dup2 runs on all of them at once
+        # (one process each), and the bookkeeping is done afterwards.
+        jobs = []
+        # threads computing roots in each dup2 (dup2 -t, default 3 there):
+        # 6 is best on a 32-thread machine for two slices
+        # Only a threads value given for the filtering (tasks.filter...)
+        # counts: the global tasks.threads reached dup2 through the
+        # parameter hierarchy, and this default never applied.
+        dup2_args = dict(self.merged_args[0])
+        task_path = self.parameters.get_param_path()
+        where = self.parameters.parameters.locate(".".join(
+            task_path + [self.programs[0][0].name, "threads"]))
+        if where is None or not where.startswith(".".join(task_path[:2])):
+            ncpu = os.cpu_count() or 1
+            dup2_args["threads"] = min(6, max(3, ncpu // (2 * self.nr_slices)))
         for i in range(0, self.nr_slices):
             files = self.send_request(Request.GET_DUP1_FILENAMES, i.__eq__)
             rel_count = self.send_request(Request.GET_DUP1_RELCOUNT, i)
@@ -4630,16 +4688,38 @@ class Duplicates2Task(Task, FilesCreator, HasStatistics):
                                              rel_count=rel_count,
                                              stdout=str(stdoutpath),
                                              stderr=str(stderrpath),
-                                             **self.merged_args[0])
+                                             **dup2_args)
             else:
                 filelistname = self.make_filelist(files, prefix="dup1")
                 p = cadoprograms.Duplicates2(rel_count=rel_count,
                                              filelist=filelistname,
                                              stdout=str(stdoutpath),
                                              stderr=str(stderrpath),
-                                             **self.merged_args[0])
-            message = self.submit_command(p, None, log_errors=True)
-            if message.get_exitcode(0) != 0:
+                                             **dup2_args)
+            jobs.append((i, files, p, stdoutpath, stderrpath))
+
+        def run_one(p):
+            return cadocommand.Command(p).wait()
+
+        cputime_used = os.times()[2]
+        realtime_used = time.time()
+        if len(jobs) > 1:
+            with concurrent.futures.ThreadPoolExecutor(len(jobs)) as ex:
+                results = list(ex.map(run_one, [j[2] for j in jobs]))
+        else:
+            results = [run_one(j[2]) for j in jobs]
+        if jobs:
+            self.update_cpu_real_time(cadoprograms.Duplicates2.name,
+                                      os.times()[2] - cputime_used,
+                                      time.time() - realtime_used, True)
+
+        for (i, files, p, stdoutpath, stderrpath), (rc, stdout, stderr) \
+                in zip(jobs, results):
+            if rc != 0:
+                message = Task.ResultInfo(self.make_wuname(None), rc, stdout,
+                                          stderr, p, p.make_command_line(),
+                                          "server")
+                self.log_failed_command_error(message, 0)
                 raise Exception("Program failed")
             with stderrpath.open("r") as stderrfile:
                 nr_rels = self.parse_remaining(stderrfile)
@@ -4791,7 +4871,7 @@ class PurgeTask(Task):
         else:
             self.logger.info("Reading %d Galois unique" % input_nrels)
 
-        use_gz = ".gz" if self.params["gzip"] else ""
+        use_gz = self.compression_suffix()
         purgedfile = self.workdir.make_filename("purged" + use_gz)
         if self.params["computation"] == Computation.DLP:
             relsdelfile = self.workdir.make_filename("relsdel" + use_gz)
@@ -4811,6 +4891,15 @@ class PurgeTask(Task):
         else:
             relsdelfile = None
             keep = self.keep
+            # bwc over GF(2) works with blocks of at least m = n = 64
+            # and needs a matrix of more than m + n rows (prep loops
+            # forever otherwise); merge leaves about the excess that
+            # purge keeps. With keep = 32 (params.qs.c40) the c40 QS
+            # matrix had 127 rows, and the run hung.
+            if keep is not None and keep < 160:
+                self.logger.info("Increasing keep from %d to 160 for the"
+                                 " linear algebra (blocks of 64)", keep)
+                keep = 160
         freerel_filename = self.merged_args[0].pop("_freerel", None)
         # Remark: "Galois unique" and "unique" are in the same files
         # because filter_galois works in place. Same request.
@@ -4873,18 +4962,35 @@ class PurgeTask(Task):
         estimate how many new (unique) relations we need.
         """
 
-        additional = nunique * self.params["add_ratio"]
-        # if the excess is negative, we need at least -excess new relations
-        if excess < 0:
-            additional = max(additional, -excess)
+        add_ratio = self.params["add_ratio"]
+        # With the GPU siever, more relations are cheap and each round of
+        # filtering is not: ask for more at once (toplevel.py sets this).
+        if os.environ.get("CADO_SIEVE_WU_LIMIT"):
+            add_ratio = max(add_ratio, 0.05)
+        additional = nunique * add_ratio
+        target = 0
         required_excess = self.params["required_excess"]
         if required_excess > 0.0:
             # we might need more relations due to required_excess
             nprimes = nunique - excess  # correct whatever the sign of excess
             # we have nprimes ideals, and we want an excess of at least
             # required_excess * nprimes
-            target_excess = int(required_excess * nprimes)
-            additional = max(additional, target_excess - excess)
+            target = int(required_excess * nprimes)
+        # if the excess is short, we need at least that many new relations
+        if excess < target:
+            additional = max(additional, target - excess)
+        # The excess grows much more slowly than the number of relations
+        # near the threshold (by about 1 for 5 new relations on a c120),
+        # so asking for just the shortfall takes many rounds. From the
+        # previous round, extrapolate with the measured slope, plus 10%.
+        prev = self.state.get("excess_history")
+        if prev:
+            pn, pe = (int(x) for x in prev.split(","))
+            if nunique > pn and excess > pe and excess < target:
+                slope = (nunique - pn) / (excess - pe)
+                additional = max(additional,
+                                 int(1.1 * slope * (target - excess)))
+        self.state["excess_history"] = "%d,%d" % (nunique, excess)
         # Always request at least 10k more
         additional = max(additional, 10000)
 
@@ -5135,7 +5241,7 @@ class MergeDLPTask(Task):
             # nmaps = self.send_request(Request.GET_NMAPS)
             # keep = sum(nmaps)
             # We use .gzip by default, unless set to no in parameters
-            use_gz = ".gz" if self.params["gzip"] else ""
+            use_gz = self.compression_suffix()
             historyfile = self.workdir.make_filename("history" + use_gz)
             (stdoutpath, stderrpath) = self.make_std_paths(
                 cadoprograms.MergeDLP.name)
@@ -5255,7 +5361,7 @@ class MergeTask(Task):
                 del self.state["densefile"]
 
             # We use .gzip by default, unless set to no in parameters
-            use_gz = ".gz" if self.params["gzip"] else ""
+            use_gz = self.compression_suffix()
             historyfile = self.workdir.make_filename("history" + use_gz)
             (stdoutpath, stderrpath) = self.make_std_paths(
                 cadoprograms.Merge.name)
@@ -6176,17 +6282,27 @@ class SqrtTask(Task):
             purged = self.merged_args[0].pop("purged", None)
             index = self.merged_args[0].pop("index", None)
             kernel = self.merged_args[0].pop("kernel", None)
+            # threads = 0 means "choose" (auto_threads, below): the
+            # step that writes the dependency files runs with 1
+            ab_args = dict(self.merged_args[0])
+            if ab_args.get("threads", 1) == 0:
+                ab_args["threads"] = 1
             p = cadoprograms.Sqrt(ab=True,
                                   prefix=prefix, purged=purged,
                                   index=index, kernel=kernel,
                                   stdout=str(stdoutpath),
                                   stderr=str(stderrpath),
-                                  **self.merged_args[0])
+                                  **ab_args)
             message = self.submit_command(p, None, log_errors=True)
             if message.get_exitcode(0) != 0:
                 raise Exception("Program failed")
 
-            t = self.progparams[0].get("threads", 1)
+            dep_args = dict(self.merged_args[0])
+            t = dep_args.get("threads", 1)
+            if t == 0:
+                t = self.auto_threads(stderrpath)
+                self.logger.info("Processing %d dependencies at a time", t)
+            dep_args["threads"] = t
             while not self.is_done():
                 dep = self.state.get("next_dep", 0)
                 # if t == 1:
@@ -6202,7 +6318,7 @@ class SqrtTask(Task):
                     args["side0"] = args["side1"] = True
                 else:
                     args["qs"] = True
-                p = cadoprograms.Sqrt(**args, **self.merged_args[0])
+                p = cadoprograms.Sqrt(**args, **dep_args)
                 message = self.submit_command(p, f"dep{dep}", log_errors=True)
                 if message.get_exitcode(0) != 0:
                     raise Exception("Program failed")
@@ -6226,6 +6342,37 @@ class SqrtTask(Task):
             if not isprime:
                 return False
         return True
+
+    def auto_threads(self, ab_stderr):
+        """ How many dependencies to process at a time (sqrt -t): a
+        dependency succeeds with probability 1/2 or more, so a few at
+        once cut the expected time (c120: 1 at a time 14 s on average,
+        4 at a time 11 s, and 11 s instead of 21 s when two fail), as
+        far as memory allows: about 1.1 KB per (a,b) pair at c120 (1.3
+        GB for 1.2M pairs), scaled with the size of N; half of the
+        available memory is used. At most 4. """
+        pairs = 0
+        try:
+            with open(str(ab_stderr), "r") as f:
+                for line in f:
+                    m = re.search(r": (\d+) \(a,b\) pairs", line)
+                    if m:
+                        pairs = max(pairs, int(m.group(1)))
+        except OSError:
+            pass
+        avail = 0
+        try:
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        avail = int(line.split()[1]) * 1024
+        except OSError:
+            pass
+        if pairs == 0 or avail == 0:
+            return 1
+        nbits = int(self.params["N"]).bit_length()
+        need = pairs * 1100 * max(1.0, nbits / 400)
+        return max(1, min(4, int(avail / 2 // need), os.cpu_count() or 1))
 
     def add_factor(self, factor):
         assert factor > 0

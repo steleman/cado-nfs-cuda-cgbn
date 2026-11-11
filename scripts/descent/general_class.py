@@ -122,8 +122,16 @@ class GeneralClass(object):
             if v is not None and len(v) > 0:
                 return os.path.join(os.path.dirname(self.args.db), v[0])
         elif self.args.datadir and self.args.prefix:
-            return os.path.join(self.args.datadir,
+            path = os.path.join(self.args.datadir,
                                 self.args.prefix + "." + typical)
+            # cado-nfs.py may have written it with another compression
+            # (tasks.compression: .zst when zstd is installed)
+            if typical.endswith(".gz") and not os.path.exists(path):
+                base = path[:-len(".gz")]
+                for alt in (base + ".zst", base):
+                    if os.path.exists(alt):
+                        return alt
+            return path
         raise ValueError("no %s file known" % shortname)
 
     def __getarg(self, shortname, table, key):

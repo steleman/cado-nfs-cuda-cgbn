@@ -7,6 +7,7 @@
 #include <sstream>
 
 #include "las-detached-cofac.hpp"
+#include "ecm/facul-gpu.hpp"
 #include "las-auxiliary-data.hpp"
 #include "las-cofactor.hpp"
 #include "las-cofac-standalone.hpp"
@@ -30,7 +31,8 @@
 static relation detached_cofac_inner(worker_thread * worker,
         nfs_work_cofac & wc,
         nfs_aux & aux,
-        cofac_standalone && cur)
+        cofac_standalone && cur,
+        facul_gpu_outcome const * gpu)
 {
     /* Import some contextual stuff. */
     int const id = worker->rank();
@@ -52,7 +54,16 @@ static relation detached_cofac_inner(worker_thread * worker,
     SIBLING_TIMER(timer, "cofactoring"); // aka factor_leftover_norms
     TIMER_CATEGORY(timer, cofactoring_mixed());
 
-    int const pass = cur.factor_leftover_norms(wc);
+    int pass;
+    if (gpu && !gpu->cpu) {
+        /* done on the GPU, with the same outcome as the CPU code */
+        pass = gpu->status;
+        if (pass > 0)
+            for (size_t side = 0; side < gpu->primes.size(); side++)
+                cur.lps[side] = gpu->primes[side];
+    } else {
+        pass = cur.factor_leftover_norms(wc);
+    }
     rep.survivors.cofactored += (pass != 0);
 
     if (cur.trace_on_spot() && pass == 0) {
@@ -75,6 +86,35 @@ static relation detached_cofac_inner(worker_thread * worker,
     TIMER_CATEGORY(timer, bookkeeping());
 
     las.cofac_stats.success(cof_bitsize);
+
+    /* The common case only prints the relation: format it directly
+     * (cofac_standalone::format_relation, the same text), instead of
+     * building a relation with two mpz per prime, sorting and
+     * printing those. That was about a sixth of las's CPU time with
+     * the GPU siever (c140), which the CPU must keep up with on faster
+     * GPUs. */
+    if (!las.suppress_duplicates && las.galois == nullptr
+            && !dlp_descent && !cur.trace_on_spot()) {
+        std::string text;
+        text.reserve(256);
+        if (cur.format_relation(aux.doing, text)) {
+            nfs_aux::abpair_t const ab(cur.a, cur.b);
+            const bool is_new_rel = rel_hash.locked()->insert(ab).second;
+            std::string line;
+            if (prepend_relation_time) {
+                std::ostringstream os;
+                os << "(" << seconds() - tt_qstart << ") ";
+                line = os.str();
+            }
+            if (!is_new_rel)
+                line += "# DUP ";
+            line += text;
+            line += '\n';
+            rep.reports ++;
+            verbose_fmt_print(0, 1, "{}", line);
+            return {};
+        }
+    }
 
     relation rel = cur.get_relation(aux.doing);
 
@@ -155,7 +195,8 @@ static relation detached_cofac_inner(worker_thread * worker,
 relation detached_cofac(worker_thread * worker,
         nfs_work_cofac & wc,
         nfs_aux & aux,
-        cofac_standalone && cur) /* {{{ */
+        cofac_standalone && cur,
+        facul_gpu_outcome const * gpu) /* {{{ */
 {
     /* We must exit by cleaning the param structure we've been given. But
      * everything we do with the objects whose life is dependent on our
@@ -176,10 +217,10 @@ relation detached_cofac(worker_thread * worker,
     relation res;
     if (dlp_descent) {
         CHILD_TIMER(timer, __func__);
-        res = detached_cofac_inner(worker, wc, aux, std::move(cur));
+        res = detached_cofac_inner(worker, wc, aux, std::move(cur), gpu);
     } else {
         ENTER_THREAD_TIMER(timer);
-        res = detached_cofac_inner(worker, wc, aux, std::move(cur));
+        res = detached_cofac_inner(worker, wc, aux, std::move(cur), gpu);
     }
 
     return res;

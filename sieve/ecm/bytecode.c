@@ -1037,6 +1037,25 @@ bytecode_prac_check (bytecode_const bc, mpz_srcptr E, int verbose)
   return ret;
 }
 
+/* The scalar k such that the PRAC bytecode computes k*P (0 on success). */
+int
+bytecode_prac_scalar (bytecode_const bc, mpz_ptr E)
+{
+  int ret = 0;
+  mpz_t R[5];
+  for (unsigned int i = 0; i < 5; i++)
+    mpz_init (R[i]);
+  mpz_set_ui (R[0], 1);
+  if (bc != NULL)
+    ret = bytecode_prac_check_internal (bc, NULL, R, 5, 0);
+  else
+    mpz_set (R[1], R[0]);
+  mpz_set (E, R[1]);
+  for (unsigned int i = 0; i < 5; i++)
+    mpz_clear (R[i]);
+  return ret;
+}
+
 /* If not NULL, endptr will contain the address of a pointer to the last parsed
  * byte.
  */
@@ -1399,5 +1418,27 @@ bytecode_mishmash_check (bytecode_const bc, mpz_srcptr E, int verbose)
   /* free array */
   free (R);
 
+  return ret;
+}
+
+/* The scalar k such that the MISHMASH bytecode computes k*P (0 on success). */
+int
+bytecode_mishmash_scalar (bytecode_const bc, mpz_ptr E)
+{
+  uint8_t t, n;
+  bytecode_elt_split_4_4 (&t, &n, *bc);
+  if (t != MISHMASH_INIT)
+    return 1;
+  unsigned int const R_nalloc = n+2;
+  mpz_t *R = (mpz_t *) malloc (R_nalloc * sizeof (mpz_t));
+  FATAL_ERROR_CHECK (R == NULL, "could not malloc R");
+  for (unsigned int i = 0; i < R_nalloc; i++)
+    mpz_init (R[i]);
+  mpz_set_ui (R[1], 1);
+  int const ret = bytecode_mishmash_check_internal (bc, NULL, R, R_nalloc, 0);
+  mpz_set (E, R[1]);
+  for (unsigned int i = 0; i < R_nalloc; i++)
+    mpz_clear (R[i]);
+  free (R);
   return ret;
 }

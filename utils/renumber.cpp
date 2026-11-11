@@ -410,7 +410,19 @@ auto renumber_t::get_first_iterator_from_p(p_r_values_t p) const -> const_iterat
 
     std::array<p_r_values_t, 2> const p0 {{ p, 0 }};
     {
-        auto it = std::lower_bound(flat_data.begin(), flat_data.end(), p0);
+        /* Every entry before coarse_index[b] has a prime below
+         * b << coarse_shift <= p, and every entry from coarse_index[b+1]
+         * on a prime above p: searching in between gives the same
+         * answer as searching the whole table. */
+        auto lo = flat_data.begin(), hi = flat_data.end();
+        size_t const b = (size_t) p >> coarse_shift;
+        if (b + 1 < coarse_index.size()) {
+            lo = flat_data.begin() + coarse_index[b];
+            hi = flat_data.begin() + coarse_index[b + 1];
+        } else if (!coarse_index.empty()) {
+            lo = flat_data.begin() + coarse_index.back();
+        }
+        auto it = std::lower_bound(lo, hi, p0);
         if (it == flat_data.end())
             throw prime_is_too_large(p);
         if ((*it)[0] != p) {
@@ -1168,6 +1180,23 @@ void renumber_t::compute_index_from_p_cache()
         index_from_p_cache.push_back(i);
     }
     above_cache = above_bad + i;
+
+    /* the coarse index of the whole table (see renumber.hpp): blocks of
+     * 2^coarse_shift numbers, at most 2^20 blocks */
+    coarse_index.clear();
+    if (flat_data.empty()) return;
+    p_r_values_t const pmax = flat_data[flat_data.size() - 1][0];
+    coarse_shift = 0;
+    while (((uint64_t) pmax >> coarse_shift) >= (UINT64_C(1) << 20))
+        coarse_shift++;
+    size_t const nblocks = ((size_t) pmax >> coarse_shift) + 1;
+    coarse_index.assign(nblocks + 1, flat_data.size());
+    size_t b = 0;
+    for (index_t j = 0; j < flat_data.size(); j++) {
+        size_t const pb = (size_t) flat_data[j][0] >> coarse_shift;
+        for ( ; b <= pb; b++)
+            coarse_index[b] = j;
+    }
 }
 
 /* Convert a blob whose entries are not the width we were compiled for.

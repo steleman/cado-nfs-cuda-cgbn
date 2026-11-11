@@ -38,6 +38,26 @@ double sopt_local_descent (cxx_mpz_poly &, cxx_mpz_poly &, cxx_mpz_poly const &,
 double size_optimization (cxx_mpz_poly &, cxx_mpz_poly &, cxx_mpz_poly const &,
                           cxx_mpz_poly const &, unsigned int, int);
 
+/* sopt_local_descent from the state at the beginning of an iteration:
+   steps kt = 2^kt_exp, k[i] = 2^k_exp[i], iter iterations done */
+double sopt_local_descent_continue (cxx_mpz_poly & f_opt, cxx_mpz_poly & g_opt,
+                                    int kt_exp, int const * k_exp,
+                                    unsigned int iter, int use_translation,
+                                    int deg_rotation, unsigned int max_iter,
+                                    int verbose);
+
+/* size_optimization of several pairs at once: the same results as
+   size_optimization on each, in order, with the local descents of all of
+   them run together (on the GPU when sopt_gpu_descents uses it). */
+#include <vector>
+struct sopt_batch_item {
+    cxx_mpz_poly f_raw, g_raw;  /* input */
+    cxx_mpz_poly f_opt, g_opt;  /* output */
+    double lognorm = 0;         /* size_optimization's return value */
+};
+void size_optimization_batch (std::vector<sopt_batch_item> & items,
+                              unsigned int sopt_effort, int verbose);
+
 #endif	/* CADO_POLYSELECT_SIZE_OPTIMIZATION_HPP */
 
 

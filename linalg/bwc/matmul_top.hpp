@@ -6,6 +6,7 @@
 
 #include <string>
 #include <vector>
+#include <memory>
 #include <array>
 #include <gmp.h>                 // for gmp_randstate_t
 
@@ -135,5 +136,58 @@ extern void mmt_vec_apply_P(matmul_top_data & mmt, mmt_vec & y);
 extern void mmt_vec_unapply_P(matmul_top_data & mmt, mmt_vec & y);
 extern void mmt_apply_identity(mmt_vec & w, mmt_vec const & v);
 extern void indices_twist(matmul_top_data & mmt, std::vector<uint32_t> & xs, int d);
+
+/* {{{ products with the vectors kept on the GPUs (mm_impl=cuda)
+ *
+ * Usable (operator bool) with one thread per MPI job, no interleaving,
+ * one matrix and the cuda backend; the caller keeps its host loop
+ * otherwise, or with CADO_BWC_CUDA_RESIDENT=0. Each job's matrix block
+ * is on its own GPU.
+ *
+ * A device vector holds the job's whole slice [i0,i1) of a vector in
+ * direction d (that of v0), the same on every job sharing the slice:
+ * an mmt_vec with consistency 2.
+ *
+ * mul(cur, tmp) is matmul_top_mul with its communication; the result is
+ * in cur afterwards, tmp is scratch (the two may be swapped):
+ *  - one job: tmp = M cur and a swap, since reduce + broadcast is then
+ *    a copy;
+ *  - several: tmp = M_local cur; an XOR reduce-scatter over the jobs of
+ *    pi.wr[!d] (chunk k of tmp to job k), whose result is our piece of
+ *    cur; then an in-place all-gather of the pieces over pi.wr[d]. That
+ *    is what mmt_vec_reduce + mmt_vec_broadcast do with one thread per
+ *    job. The exchanges go through NCCL, or through MPI with host
+ *    buffers (CADO_BWC_GPU_COMM=mpi; the only choice without NCCL, and
+ *    the one that works with several jobs on one GPU).
+ */
+struct bwc_cuda_mat;
+struct mmt_cuda_transport;
+class mmt_cuda {
+    matmul_top_data & mmt;
+    int d;
+    bwc_cuda_mat * G = nullptr;
+    int gather = 0;
+    size_t elt = 0;             /* bytes per item */
+    size_t eblock = 0;          /* items in a job's own piece */
+    size_t own_off = 0;         /* items: our piece within the slice */
+    void * slots = nullptr;     /* reduce-scatter receive buffers */
+    std::unique_ptr<mmt_cuda_transport> tr;
+  public:
+    size_t vitems = 0;          /* items in the slice */
+    size_t vbytes = 0;
+    /* size for both buffers given to mul() (the product's output slice
+     * may be larger than the input one) */
+    size_t tmpbytes = 0;
+    mmt_cuda(matmul_top_data & mmt, mmt_vec const & v0, mmt_vec const & v1);
+    ~mmt_cuda();
+    mmt_cuda(mmt_cuda const &) = delete;
+    mmt_cuda & operator=(mmt_cuda const &) = delete;
+    explicit operator bool() const { return G != nullptr; }
+    bwc_cuda_mat * mat() const { return G; }
+    /* "local", "nccl" or "mpi" */
+    const char * comm_name() const;
+    void mul(void *& cur, void *& tmp);
+};
+/* }}} */
 
 #endif	/* MATMUL_TOP_HPP_ */

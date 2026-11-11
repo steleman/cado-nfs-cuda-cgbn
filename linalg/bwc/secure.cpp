@@ -9,6 +9,7 @@
 #include <memory>
 #include <algorithm>
 #include <vector>
+#include <utility>
 
 #include <gmp.h>
 #include "fmt/base.h"
@@ -31,6 +32,9 @@
 #include "bwc_filenames.hpp"
 #include "misc.h"
 #include "cado_main.hpp"
+#ifdef HAVE_CUDA
+#include "matmul-cuda-kernels.h"
+#endif
 
 /* We create the check data based on:
  *
@@ -317,6 +321,30 @@ static void * sec_prog(parallelizing_info & pi, cxx_param_list & pl, void * arg 
     }
     // }}}
 
+#ifdef HAVE_CUDA
+    /* One GPU does the whole product: keep my and dvec on it between
+     * check stops. Products here are in the backend's slow (scatter)
+     * direction. */
+    mmt_cuda gpu(mmt, my, myy[1]);
+    bwc_cuda_mat * G = gpu ? gpu.mat() : nullptr;
+    size_t const gpu_vbytes = gpu.vbytes;
+    void * gpu_my[2] = { nullptr, nullptr };
+    void * gpu_d = nullptr;
+    if (G) {
+        ASSERT_ALWAYS(dvec.i1 - dvec.i0 == gpu.vitems);
+        ASSERT_ALWAYS(A->simd_groupsize() % 64 == 0);
+        gpu_my[0] = bwc_cuda_alloc(G, gpu.tmpbytes);
+        gpu_my[1] = bwc_cuda_alloc(G, gpu.tmpbytes);
+        gpu_d = bwc_cuda_alloc(G, gpu_vbytes);
+    }
+    auto clean_gpu = call_dtor([&]() {
+        if (!G) return;
+        bwc_cuda_free(G, gpu_my[0]);
+        bwc_cuda_free(G, gpu_my[1]);
+        bwc_cuda_free(G, gpu_d);
+    });
+#endif
+
     int k = bw->start;
     for(int const next : check_stops) {
         pi.m.serialize(__FILE__, __LINE__);
@@ -350,6 +378,33 @@ static void * sec_prog(parallelizing_info & pi, cxx_param_list & pl, void * arg 
             pi.m.bcast(Rdata_stream, nchecks * (next - k0), A_pi, 0, 0);
         }
     
+#ifdef HAVE_CUDA
+        if (G && next > k0) {
+            size_t const rbytes = A->vec_elt_stride(nchecks * (next - k0));
+            void * gpu_r = bwc_cuda_alloc(G, rbytes);
+            unsigned int const K = A->simd_groupsize() / 64;
+            bwc_cuda_upload(G, gpu_r, Rdata_stream, rbytes);
+            bwc_cuda_upload(G, gpu_my[0], my.v, gpu_vbytes);
+            bwc_cuda_upload(G, gpu_d, dvec.v, gpu_vbytes);
+            for( ; k < next ; k++) {
+                /* on the whole slice, as in mksol */
+                bwc_cuda_addmul_tiny(G, gpu_d, gpu_my[0],
+                        (char *) gpu_r + A->vec_elt_stride((k-k0) * nchecks),
+                        gpu.vitems, K, K);
+                gpu.mul(gpu_my[0], gpu_my[1]);
+                if (tcan_print && (k - k0) % 64 == 63) {
+                    bwc_cuda_sync(G);
+                    putchar('.');
+                    fflush(stdout);
+                }
+            }
+            bwc_cuda_download(G, my.v, gpu_my[0], gpu_vbytes);
+            bwc_cuda_download(G, dvec.v, gpu_d, gpu_vbytes);
+            bwc_cuda_free(G, gpu_r);
+            my.consistency = 2;
+            dvec.consistency = 2;
+        }
+#endif
         for( ; k < next ; k++) {
             /* new random coefficient in R */
             arith_generic::elt * Rdata = A->vec_subvec(Rdata_stream, (k-k0) * nchecks);

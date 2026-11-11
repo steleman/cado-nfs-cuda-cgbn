@@ -19,6 +19,20 @@ endif()
 add_executable(characters characters.cpp bwc/worker-threads.c)
 cado_apply_pch(characters)
 target_link_libraries(characters PRIVATE bitlinalg utils_with_io pthread)
+if(HAVE_CUDA)
+    # the character matrix on the GPU (characters_gpu.cu), signs with CGBN
+    add_library(characters_gpu STATIC characters_gpu.cu)
+    # cado_gpu_claim (utils/gpu_claim.cpp)
+    target_link_libraries(characters_gpu PUBLIC utils)
+    set_target_properties(characters_gpu PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        CUDA_RUNTIME_LIBRARY Shared)
+    target_include_directories(characters_gpu PRIVATE ${CGBN_INCLUDE_DIR})
+    target_compile_options(characters_gpu PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+    target_link_libraries(characters_gpu PUBLIC CUDA::cudart)
+    target_link_libraries(characters PRIVATE characters_gpu)
+endif()
 install(TARGETS characters RUNTIME DESTINATION ${LIBSUFFIX}/linalg)
 
 if(HAVE_M4RI)

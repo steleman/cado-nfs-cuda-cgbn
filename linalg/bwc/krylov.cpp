@@ -6,6 +6,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <gmp.h>
@@ -30,6 +31,9 @@
 #include "xdotprod.hpp"
 #include "xvectors.hpp"
 #include "cado_main.hpp"
+#ifdef HAVE_CUDA
+#include "matmul-cuda-kernels.h"
+#endif
 
 using namespace fmt::literals;
 
@@ -278,6 +282,44 @@ static void * krylov_prog(parallelizing_info & pi, cxx_param_list & pl, void * a
     pi.interleaving_flip();
     pi.interleaving_flip();
 
+#ifdef HAVE_CUDA
+    /* One GPU does the whole product: keep the vector, the A block and
+     * the x positions on it for a whole interval. */
+    mmt_cuda gpu(mmt, ymy[0], ymy[1]);
+    bwc_cuda_mat * G = gpu ? gpu.mat() : nullptr;
+    size_t const gpu_vbytes = gpu.vbytes;
+    size_t const gpu_xybytes = A->vec_elt_stride(bw->m * bw->interval);
+    void * gpu_v[2] = { nullptr, nullptr };
+    void * gpu_xy = nullptr;
+    uint32_t * gpu_pos = nullptr;
+    if (G) {
+        /* the entries x_dotprod reads, relative to v.v (our own piece
+         * only; the A blocks of the jobs are added up at interval end) */
+        unsigned int const vi0 = ymy[0].i0 + mmt_my_own_offset_in_items(ymy[0]);
+        unsigned int const vi1 = vi0 + mmt_my_own_size_in_items(ymy[0]);
+        std::vector<uint32_t> pos(bw->m * nx);
+        for(unsigned int k = 0 ; k < pos.size() ; k++) {
+            uint32_t const i = gxvecs[k];
+            pos[k] = (i < vi0 || i >= vi1) ? UINT32_MAX : i - ymy[0].i0;
+        }
+        gpu_v[0] = bwc_cuda_alloc(G, gpu.tmpbytes);
+        gpu_v[1] = bwc_cuda_alloc(G, gpu.tmpbytes);
+        gpu_xy = bwc_cuda_alloc(G, gpu_xybytes);
+        gpu_pos = (uint32_t *) bwc_cuda_alloc(G, pos.size() * sizeof(uint32_t));
+        bwc_cuda_upload(G, gpu_pos, pos.data(), pos.size() * sizeof(uint32_t));
+        if (tcan_print)
+            fmt::print("krylov: vectors kept on GPU {} (communication: {})\n",
+                    bwc_cuda_mat_device(G), gpu.comm_name());
+    }
+    auto clean_gpu = call_dtor([&]() {
+        if (!G) return;
+        bwc_cuda_free(G, gpu_v[0]);
+        bwc_cuda_free(G, gpu_v[1]);
+        bwc_cuda_free(G, gpu_xy);
+        bwc_cuda_free(G, gpu_pos);
+    });
+#endif
+
     for(int s = bw->start ; s < bw->end ; s += bw->interval ) {
 
         if (C) C->plan_ahead(ymy[0]);
@@ -294,6 +336,26 @@ static void * krylov_prog(parallelizing_info & pi, cxx_param_list & pl, void * a
         A->vec_set_zero(xymats, bw->m*bw->interval);
         pi.m.serialize(__FILE__, __LINE__);
         pi.interleaving_flip();
+#ifdef HAVE_CUDA
+        if (G) {
+            bwc_cuda_upload(G, gpu_v[0], ymy[0].v, gpu_vbytes);
+            bwc_cuda_zero(G, gpu_xy, gpu_xybytes);
+            for(int i = 0 ; i < bw->interval ; i++) {
+                bwc_cuda_xdot(G,
+                        (char *) gpu_xy + A->vec_elt_stride(i * bw->m),
+                        gpu_pos, bw->m, nx, gpu_v[0]);
+                gpu.mul(gpu_v[0], gpu_v[1]);
+                bwc_cuda_sync(G);
+                /* the four timers matmul_top_mul would switch */
+                for(int t = 0 ; t < 4 ; t++)
+                    timing_next_timer(timing);
+                timing_check(pi, timing, s+i+1, tcan_print);
+            }
+            bwc_cuda_download(G, ymy[0].v, gpu_v[0], gpu_vbytes);
+            bwc_cuda_download(G, xymats, gpu_xy, gpu_xybytes);
+            ymy[0].consistency = 2;
+        } else
+#endif
         for(int i = 0 ; i < bw->interval ; i++) {
             /* Compute the product by x */
             x_dotprod(A->vec_subvec(xymats, i * bw->m),

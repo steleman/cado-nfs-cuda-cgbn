@@ -64,9 +64,11 @@ void streambase_maybe_compressed::open(std::string const & name_arg, std::ios_ba
         if (!orig_name.ends_with(r.suffix)) continue;
         std::string command;
         if (mode & std::ios_base::in && *r.pfmt_in)
-            command = fmt::format(fmt::runtime(r.pfmt_in), name);
+            command = fmt::format(fmt::runtime(
+                        cado::details::compression_command(r, false)), name);
         else if (mode & std::ios_base::out && *r.pfmt_out)
-            command = fmt::format(fmt::runtime(r.pfmt_out), name);
+            command = fmt::format(fmt::runtime(
+                        cado::details::compression_command(r, true)), name);
 
         if (!command.empty()) {
             /* apparently popen() under Linux does not accept the 'b' modifier */

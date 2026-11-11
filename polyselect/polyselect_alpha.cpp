@@ -145,8 +145,30 @@ always returns 0 in val(f,p).
 
 Assumes p divides disc = disc(f), d is the degree of f.
 */
+static thread_local alpha_rootcount_fn alpha_rc_fn = nullptr;
+static thread_local void * alpha_rc_arg = nullptr;
+
+void set_alpha_rootcount_source(alpha_rootcount_fn fn, void * arg)
+{
+    alpha_rc_fn = fn;
+    alpha_rc_arg = arg;
+}
+
+/* special_valuation, with nroots the number of distinct roots of f mod p
+   if it is known (else -1) */
+static double special_valuation_rc(mpz_poly_srcptr f, unsigned long p,
+                                   mpz_srcptr disc, gmp_randstate_ptr rstate,
+                                   int nroots);
+
 double special_valuation(mpz_poly_srcptr f, unsigned long p, mpz_srcptr disc,
                          gmp_randstate_ptr rstate)
+{
+    return special_valuation_rc(f, p, disc, rstate, -1);
+}
+
+static double special_valuation_rc(mpz_poly_srcptr f, unsigned long p,
+                                   mpz_srcptr disc, gmp_randstate_ptr rstate,
+                                   int nroots)
 {
     double v;
     int p_divides_lc;
@@ -168,7 +190,8 @@ double special_valuation(mpz_poly_srcptr f, unsigned long p, mpz_srcptr disc,
 
     if (pvaluation_disc == 0) {
         /* easy ! */
-        unsigned int e = mpz_poly_roots_ulong(NULL, f, p, rstate);
+        unsigned int e = nroots >= 0 ? (unsigned int) nroots
+                                     : mpz_poly_roots_ulong(NULL, f, p, rstate);
         if (p_divides_lc) {
             /* Or the discriminant would have valuation 1 at least */
             ASSERT(mpz_divisible_ui_p(mpz_poly_coeff_const(f, d - 1), p) == 0);
@@ -177,7 +200,8 @@ double special_valuation(mpz_poly_srcptr f, unsigned long p, mpz_srcptr disc,
         return (pd * e) / (pd * pd - 1);
     } else if (pvaluation_disc == 1) {
         /* special case where p^2 does not divide disc */
-        unsigned int e = mpz_poly_roots_ulong(NULL, f, p, rstate);
+        unsigned int e = nroots >= 0 ? (unsigned int) nroots
+                                     : mpz_poly_roots_ulong(NULL, f, p, rstate);
         if (p_divides_lc)
             e++;
         /* something special here. */
@@ -249,14 +273,20 @@ double get_alpha(mpz_poly_srcptr f, unsigned long B)
        for coprime a, b, i.e., e = q_p*p/(p^2-1), thus the contribution for p
        is (1/(p-1) - e) * log(p) */
 
+    /* root counts from elsewhere (the GPU), if they are known */
+    const unsigned short * rc = alpha_rc_fn ? alpha_rc_fn(f, B, alpha_rc_arg) : nullptr;
+    unsigned long k = 0;
+
     /* prime p=2 */
-    e = special_valuation(f, 2, disc, rstate);
+    e = special_valuation_rc(f, 2, disc, rstate, rc ? (int) rc[k] : -1);
+    k++;
     alpha = (1.0 - e) * log(2.0);
 
     /* FIXME: generate all primes up to B and pass them to get_alpha */
     for (p = 3; p <= B; p += 2)
         if (ulong_isprime(p)) {
-            e = special_valuation(f, p, disc, rstate);
+            e = special_valuation_rc(f, p, disc, rstate, rc ? (int) rc[k] : -1);
+            k++;
             alpha += (1.0 / (double)(p - 1) - e) * log((double)p);
         }
     gmp_randclear(rstate);

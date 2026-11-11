@@ -38,6 +38,9 @@
 #include "las-coordinates.hpp"
 #include "las-special-q-task-collection.hpp"
 #include "las-detached-cofac.hpp"
+#include "las-cofac-gpu.hpp"
+#include "las-sieve-gpu.hpp"
+#include "bucket-push-update.hpp"       // IWYU pragma: keep
 #include "las-divide-primes.hpp"
 #include "las-dumpfile.hpp"
 #include "las-globals.hpp"
@@ -228,6 +231,8 @@ struct process_bucket_region_run {/*{{{*/
     void cofactoring_sync (survivors_t & survivors2);
     void filter_survivors_by_region(survivors_t & survivors);
     void operator()();
+    /* the region was sieved on the GPU (las-sieve-gpu.hpp) */
+    void run_gpu(gpu_sieve_region const & G);
 };
 /*}}}*/
 
@@ -273,7 +278,8 @@ process_bucket_region_run::process_bucket_region_run(
     }
 
     SS = tws.SS;
-    memset(SS, 0, BUCKET_REGION);
+    /* SS is cleared in operator()(), the only user: the GPU siever's
+     * regions (run_gpu) do not need it */
 
     do_resieve = ws.conf.needs_resieving();
 }
@@ -886,7 +892,9 @@ void process_bucket_region_run::cofactoring_sync (survivors_t & survivors)/*{{{*
         {
             /* see above */
             rep.reports++;
-            if (ws.conf.sublat_bound && !cur.ab_coprime()) continue;
+            /* without sublattices (sublat_bound == 1), gcd(i,j) = 1
+             * already makes (a,b) coprime */
+            if (ws.conf.sublat_bound > 1 && !cur.ab_coprime()) continue;
             /* make sure threads don't write the cofactor list at the
              * same time !!! */
             cur.transfer_to_cofac_list(ws.cofac_candidates);
@@ -897,7 +905,11 @@ void process_bucket_region_run::cofactoring_sync (survivors_t & survivors)/*{{{*
          * _each_ (a,b) pair that is to be cofactored...
          */
 
-        if (!dlp_descent && !exit_after_rel_found) {
+        if (!dlp_descent && !exit_after_rel_found && las_cofac_gpu::get()) {
+            /* batched on the GPU (las-cofac-gpu.hpp) */
+            las_cofac_gpu::get()->submit(worker->get_pool(), wc_p, aux_p,
+                    std::move(cur));
+        } else if (!dlp_descent && !exit_after_rel_found) {
             /* We must make sure that we join the async threads at some
              * point, otherwise we'll leak memory. It seems more appropriate
              * to batch-join only, so this is done at the las_subjob level */
@@ -928,6 +940,8 @@ void process_bucket_region_run::operator()() {/*{{{*/
     auto tt = worker->trace(chronograms::PBR(
                 first_region0_index / ws.nb_buckets[1],
                 bucket_relative_index));
+
+    memset(SS, 0, BUCKET_REGION);
 
     int const nsides = (int) sides.size();
 
@@ -964,6 +978,10 @@ void process_bucket_region_run::operator()() {/*{{{*/
 
         /* Compute norms in S[side] */
         init_norms(side);
+        if (getenv("CADO_LAS_GPU_SIEVE_NORMS"))
+            las_sieve_gpu_check_region(ws, side,
+                    first_region0_index + already_done + bucket_relative_index,
+                    S[side]);
 
         /* Accumulate sieve contributions in SS */
         apply_buckets(side);
@@ -972,6 +990,11 @@ void process_bucket_region_run::operator()() {/*{{{*/
         /* compute S[side][x] = max(S[side][x] - SS[x], 0),
          * and clear SS.  */
         SminusS(side);
+
+        if (!getenv("CADO_LAS_GPU_SIEVE_NORMS"))
+            las_sieve_gpu_check_region(ws, side,
+                    first_region0_index + already_done + bucket_relative_index,
+                    S[side]);
 
         ws.sides[side].dumpfile.write(S[side], BUCKET_REGION);
 
@@ -1020,6 +1043,69 @@ void process_bucket_region_run::operator()() {/*{{{*/
 #endif
 
     cofactoring_sync(survivors);
+}/*}}}*/
+
+void process_bucket_region_run::run_gpu(gpu_sieve_region const & G)/*{{{*/
+{
+    int const nsides = (int) sides.size();
+
+    /* what search_survivors counts */
+    rep.survivors.before_sieve += 1U << LOG_BUCKET_REGION;
+
+    /* only the survivors' positions are read from here on */
+    for (int side = 0; side < nsides; side++)
+        for (size_t k = 0; k < G.x.size(); k++)
+            S[side][G.x[k]] = G.S[side][k];
+
+    survivors_t survivors(G.x.begin(), G.x.end());
+
+    if (!wc_p->accept_estimate.empty() && nsides == 2 && S[0] && S[1])
+        filter_survivors_by_region(survivors);
+
+    /* purge_buckets and resieve, from what the GPU found */
+    for (int side = 0; !survivors.empty() && do_resieve && side < nsides; side++) {
+        MARK_TIMER_FOR_SIDE(timer, side);
+        sides[side].purged.allocate_memory(ws.local_memory,
+                G.purged[side].size() + 1);
+        for (auto const & u : G.purged[side])
+            sides[side].purged.push_update(u);
+        sides[side].purged.sort();
+        sides[side].primes.allocate_memory(ws.local_memory,
+                G.primes[side].size() + 1);
+        for (auto const & u : G.primes[side])
+            sides[side].primes.push_update(u);
+        sides[side].primes.sort();
+    }
+
+    cofactoring_sync(survivors);
+}/*}}}*/
+
+void process_gpu_regions(
+        nfs_work & ws,
+        std::shared_ptr<nfs_work_cofac> wc_p,
+        std::shared_ptr<nfs_aux> aux_p,
+        ALGO::special_q_data const & Q,
+        thread_pool & pool,
+        where_am_I & w,
+        std::shared_ptr<std::vector<gpu_sieve_region>> regions,
+        task_group * tg)/*{{{*/
+{
+    /* the caller's Q may be gone before the tasks run (see las_subjob) */
+    auto Qp = std::make_shared<ALGO::special_q_data const>(Q);
+    for (size_t k = 0; k < regions->size(); k++) {
+        auto f = [&ws, wc_p, aux_p, Qp, w, regions, k](worker_thread * worker) {
+                    timetree_t & timer(aux_p->get_timer(worker));
+                    ENTER_THREAD_TIMER(timer);
+                    gpu_sieve_region const & G = (*regions)[k];
+                    process_bucket_region_run R(ws, wc_p, aux_p, *Qp, w,
+                            0, 0, G.N, timer, worker);
+                    R.run_gpu(G);
+                };
+        if (tg)
+            pool.add_task(*tg, thread_pool::QUEUE_GENERIC, 0.0, std::move(f));
+        else
+            pool.add_task(thread_pool::QUEUE_GENERIC, 0.0, std::move(f));
+    }
 }/*}}}*/
 
 void process_many_bucket_regions(

@@ -1,4 +1,7 @@
 #include "cado.h" // IWYU pragma: keep
+#include <algorithm>
+#include <thread>
+#include <cstdlib>
 
 #include <string>
 #include <vector>
@@ -58,4 +61,14 @@ void cado::filter_io_details::configure(cxx_param_list & pl)
 void cado::filter_io_details::interpret_parameters(cxx_param_list & pl)
 {
     pl.parse("force-posix-threads", filter_rels_force_posix_threads);
+}
+
+size_t cado::filter_io_details::filter_rels_parse_threads()
+{
+    static size_t const n = []() -> size_t {
+        if (char const * e = getenv("CADO_FILTER_PARSE_THREADS"))
+            return std::max(1, atoi(e));
+        return std::thread::hardware_concurrency() >= 8 ? 4 : 1;
+    }();
+    return n;
 }

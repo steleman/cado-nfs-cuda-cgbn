@@ -135,6 +135,12 @@ private: /*{{{ internal data fields*/
 
     std::vector<unsigned int> lpb;
     std::vector<index_t> index_from_p_cache;
+    /* For the primes above the cache: coarse_index[b] is the index in
+     * flat_data of the first entry whose prime is >= b << coarse_shift,
+     * so that a lookup only searches between coarse_index[b] and
+     * coarse_index[b+1] (computed with index_from_p_cache). */
+    std::vector<index_t> coarse_index;
+    unsigned int coarse_shift = 0;
 
     /* This is computed on the fly when the table is built. It's cheap
      * enough anyway. We rarely use it, and we're a bit too lazy to

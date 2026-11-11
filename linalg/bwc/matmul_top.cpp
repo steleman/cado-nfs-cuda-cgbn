@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cerrno>
+#include <climits>
 
 #include <algorithm>
 #include <ranges>
@@ -41,6 +42,21 @@
 #include "timing.h"
 #include "utils_cxx.hpp"
 #include "verbose.hpp"
+#ifdef HAVE_CUDA
+#include "matmul-cuda-kernels.h"
+#ifdef HAVE_NCCL
+#include <cuda_runtime.h>
+#include <nccl.h>
+#define NCCL_CHECK(x) do {                                              \
+        ncclResult_t const r_ = (x);                                    \
+        if (r_ != ncclSuccess) {                                        \
+            fmt::print(stderr, "{} failed at {}:{}: {}\n", #x,          \
+                    __FILE__, __LINE__, ncclGetErrorString(r_));        \
+            abort();                                                    \
+        }                                                               \
+    } while (0)
+#endif
+#endif
 
 ///////////////////////////////////////////////////////////////////
 /* Start with stuff that does not depend on abase at all -- this
@@ -174,6 +190,218 @@ void matmul_top_mul(matmul_top_data & mmt, mmt_vec * v, struct timing_data * tt)
     ASSERT_ALWAYS(v[0].consistency == 2);
 }
 /*}}}*/
+
+/* {{{ mmt_cuda: products with the vectors on the GPUs */
+struct mmt_cuda_transport {
+    virtual ~mmt_cuda_transport() = default;
+    virtual const char * name() const = 0;
+    /* buf holds njobs blocks of `bytes` (the jobs of pi.wr[k]); block p
+     * goes to job p, and the block job p sends us lands in slots[p].
+     * slots[me] is left alone. */
+    virtual void exchange(int k, const void * buf, void * slots, size_t bytes) = 0;
+    /* in-place all-gather over pi.wr[k] of the njobs blocks of buf */
+    virtual void allgather(int k, void * buf, size_t bytes) = 0;
+};
+
+#ifdef HAVE_CUDA
+/* MPI through host buffers: works anywhere, several jobs may share a
+ * GPU, but every exchange goes through host memory. */
+struct mmt_cuda_mpi : public mmt_cuda_transport {
+    bwc_cuda_mat * G;
+    parallelizing_info & pi;
+    std::vector<char> h1, h2;
+    mmt_cuda_mpi(bwc_cuda_mat * G, parallelizing_info & pi) : G(G), pi(pi) {}
+    const char * name() const override { return "mpi"; }
+    void exchange(int k, const void * buf, void * slots, size_t bytes) override
+    {
+        pi_comm const & c = pi.wr[k];
+        ASSERT_ALWAYS(bytes <= (size_t) INT_MAX);
+        size_t const all = c.njobs * bytes;
+        h1.resize(all);
+        h2.resize(all);
+        bwc_cuda_download(G, h1.data(), buf, all);
+        std::vector<MPI_Request> req;
+        for(unsigned int p = 0 ; p < c.njobs ; p++) {
+            if (p == c.jrank) continue;
+            req.emplace_back();
+            MPI_Irecv(h2.data() + p * bytes, (int) bytes, MPI_BYTE, (int) p,
+                    0xc0da, c.pals, &req.back());
+            req.emplace_back();
+            MPI_Isend(h1.data() + p * bytes, (int) bytes, MPI_BYTE, (int) p,
+                    0xc0da, c.pals, &req.back());
+        }
+        MPI_Waitall((int) req.size(), req.data(), MPI_STATUSES_IGNORE);
+        bwc_cuda_upload(G, slots, h2.data(), all);
+    }
+    void allgather(int k, void * buf, size_t bytes) override
+    {
+        pi_comm const & c = pi.wr[k];
+        ASSERT_ALWAYS(bytes <= (size_t) INT_MAX);
+        size_t const all = c.njobs * bytes;
+        h1.resize(all);
+        char * b = (char *) buf;
+        bwc_cuda_download(G, h1.data() + c.jrank * bytes, b + c.jrank * bytes, bytes);
+        MPI_Allgather(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL,
+                h1.data(), (int) bytes, MPI_BYTE, c.pals);
+        bwc_cuda_upload(G, buf, h1.data(), all);
+    }
+};
+
+#ifdef HAVE_NCCL
+/* NCCL on the GPUs' memory: NVLink/PCIe inside a node, the network
+ * between nodes. One communicator per direction, ranks as in pi.wr[k]
+ * (one GPU per rank: NCCL refuses two ranks on one device). NCCL has
+ * no XOR reduction, hence send/recv and the XOR kernel. */
+struct mmt_cuda_nccl : public mmt_cuda_transport {
+    bwc_cuda_mat * G;
+    parallelizing_info & pi;
+    ncclComm_t comm[2] = { nullptr, nullptr };
+    mmt_cuda_nccl(bwc_cuda_mat * G, parallelizing_info & pi) : G(G), pi(pi)
+    {
+        bwc_cuda_set_device(G);
+        /* simulated GPUs (cuda_devices.cpp): ranks share a device */
+        const char * sim = getenv("CADO_BWC_SIMULATE_GPUS");
+        if (sim && atoi(sim) > 0)
+            setenv("NCCL_MULTI_RANK_GPU_ENABLE", "1", 0);
+        for(int k = 0 ; k < 2 ; k++) {
+            pi_comm const & c = pi.wr[k];
+            if (c.njobs <= 1) continue;
+            ncclUniqueId id;
+            if (c.jrank == 0)
+                NCCL_CHECK(ncclGetUniqueId(&id));
+            MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, c.pals);
+            NCCL_CHECK(ncclCommInitRank(&comm[k], (int) c.njobs, id, (int) c.jrank));
+        }
+    }
+    ~mmt_cuda_nccl() override
+    {
+        bwc_cuda_set_device(G);
+        for(auto & c : comm)
+            if (c) ncclCommDestroy(c);
+    }
+    const char * name() const override { return "nccl"; }
+    void exchange(int k, const void * buf, void * slots, size_t bytes) override
+    {
+        pi_comm const & c = pi.wr[k];
+        auto s = (cudaStream_t) bwc_cuda_stream(G);
+        bwc_cuda_set_device(G);
+        NCCL_CHECK(ncclGroupStart());
+        for(unsigned int p = 0 ; p < c.njobs ; p++) {
+            if (p == c.jrank) continue;
+            NCCL_CHECK(ncclSend((const char *) buf + p * bytes, bytes, ncclUint8,
+                        (int) p, comm[k], s));
+            NCCL_CHECK(ncclRecv((char *) slots + p * bytes, bytes, ncclUint8,
+                        (int) p, comm[k], s));
+        }
+        NCCL_CHECK(ncclGroupEnd());
+    }
+    void allgather(int k, void * buf, size_t bytes) override
+    {
+        pi_comm const & c = pi.wr[k];
+        auto s = (cudaStream_t) bwc_cuda_stream(G);
+        bwc_cuda_set_device(G);
+        NCCL_CHECK(ncclAllGather((const char *) buf + c.jrank * bytes, buf,
+                    bytes, ncclUint8, comm[k], s));
+    }
+};
+#endif  /* HAVE_NCCL */
+#endif  /* HAVE_CUDA */
+
+mmt_cuda::mmt_cuda(matmul_top_data & mmt, mmt_vec const & v0, mmt_vec const & v1)
+    : mmt(mmt), d(v0.d)
+{
+#ifdef HAVE_CUDA
+    parallelizing_info & pi = mmt.pi;
+    const char * e = getenv("CADO_BWC_CUDA_RESIDENT");
+    if (e && *e == '0')
+        return;
+    if (pi.interleaved || pi.m.ncores != 1 || mmt.matrices.size() != 1)
+        return;
+    auto * acc = dynamic_cast<matmul_cuda_access *>(mmt.matrices[0].mm.get());
+    if (!acc)
+        return;
+    ASSERT_ALWAYS(v1.d == !d);
+    elt = v0.abase->elt_stride();
+    vitems = v0.i1 - v0.i0;
+    vbytes = elt * vitems;
+    tmpbytes = std::max(vbytes, elt * (v1.i1 - v1.i0));
+    eblock = mmt_my_own_size_in_items(v0);
+    own_off = mmt_my_own_offset_in_items(v0);
+    pi_comm const & r = pi.wr[!d];      /* reduce-scatter */
+    pi_comm const & b = pi.wr[d];       /* all-gather */
+    /* the layout mmt_vec_reduce / mmt_vec_broadcast use with one thread
+     * per job */
+    ASSERT_ALWAYS(mmt_my_own_size_in_items(v1) == eblock);
+    ASSERT_ALWAYS(v1.i1 - v1.i0 == r.njobs * eblock);
+    ASSERT_ALWAYS(vitems == b.njobs * eblock);
+    ASSERT_ALWAYS(own_off == b.jrank * eblock);
+    ASSERT_ALWAYS((elt * eblock) % sizeof(uint64_t) == 0);
+
+    bwc_cuda_mat * M = acc->cuda_mat();
+    if (pi.m.njobs > 1) {
+        const char * want = getenv("CADO_BWC_GPU_COMM");
+        std::string const w = want ? want : "";
+#ifdef HAVE_NCCL
+        if (w.empty() || w == "nccl")
+            tr = std::make_unique<mmt_cuda_nccl>(M, pi);
+#endif
+        if (!tr && (w.empty() || w == "mpi"))
+            tr = std::make_unique<mmt_cuda_mpi>(M, pi);
+        if (!tr) {
+            if (pi.m.jrank == 0)
+                fmt::print(stderr, "CADO_BWC_GPU_COMM={} is not available;"
+                        " vectors stay on the host\n", w);
+            return;
+        }
+        if (r.njobs > 1)
+            slots = bwc_cuda_alloc(M, r.njobs * eblock * elt);
+    }
+    gather = acc->cuda_gather(d);
+    G = M;
+#else
+    (void) v0; (void) v1;
+#endif
+}
+
+mmt_cuda::~mmt_cuda()
+{
+#ifdef HAVE_CUDA
+    if (G && slots)
+        bwc_cuda_free(G, slots);
+#endif
+}
+
+const char * mmt_cuda::comm_name() const
+{
+    return tr ? tr->name() : "local";
+}
+
+void mmt_cuda::mul(void *& cur, void *& tmp)
+{
+#ifdef HAVE_CUDA
+    bwc_cuda_mul_dev(G, tmp, cur, gather);
+    if (!tr) {
+        std::swap(cur, tmp);
+        return;
+    }
+    size_t const bytes = eblock * elt;
+    char * c = (char *) cur;
+    char * t = (char *) tmp;
+    pi_comm const & r = mmt.pi.wr[!d];
+    if (r.njobs > 1) {
+        tr->exchange(!d, t, slots, bytes);
+        bwc_cuda_copy(G, (char *) slots + r.jrank * bytes, t + r.jrank * bytes, bytes);
+        bwc_cuda_xor_slots(G, c + own_off * elt, slots, r.njobs, bytes / sizeof(uint64_t));
+    } else {
+        bwc_cuda_copy(G, c + own_off * elt, t, bytes);
+    }
+    if (mmt.pi.wr[d].njobs > 1)
+        tr->allgather(d, c, bytes);
+#else
+    (void) cur; (void) tmp;
+#endif
+}
+/* }}} */
 
 #if 0/*{{{*/
 /* no longer used -- was only used by prep.

@@ -804,7 +804,9 @@ class Cado_NFS_toplevel(object):
         Additionally, the parameters tasks.sqrt.threads and
         tasks.linalg.bwc.threads are set to defaults that are computed as
         follows.
-            tasks.sqrt.threads is capped to a value of 1
+            tasks.sqrt.threads is set to 0: the square root task chooses
+            how many dependencies to process at once (at most 4, as memory
+            allows)
             tasks.linalg.bwc.threads, if --server-threads is unspecified
             or set to 'all', is set to the number of *physical* cores on
             the system.
@@ -945,8 +947,8 @@ class Cado_NFS_toplevel(object):
         >>> t.parameters.get_or_set_default("tasks.polyselect.threads",0)
         2
 
-        Number of threads of the sqrt step should be capped to
-        1 by default
+        Number of threads of the sqrt step is 0 by default (the
+        square root task then chooses, see SqrtTask.auto_threads)
         >>> t = Cado_NFS_toplevel(args=['12345', '-p', os.path.os.devnull])
         >>> t.filter_out_N_paramfile_workdir()
         >>> t.parameters = cadoparams.Parameters()
@@ -954,7 +956,7 @@ class Cado_NFS_toplevel(object):
         >>> t.parameters.readparams(t.args.options)
         >>> t.set_threads_and_client_threads()
         >>> t.parameters.get_or_set_default("tasks.sqrt.threads",0)
-        1
+        0
 
         >>> t.parameters.locate("tasks.sqrt.threads")
         'tasks.sqrt.threads'
@@ -972,7 +974,7 @@ class Cado_NFS_toplevel(object):
         >>> t.parameters.readparams(t.args.options)
         >>> t.set_threads_and_client_threads()
         >>> t.parameters.get_or_set_default("tasks.sqrt.threads",0)
-        1
+        0
 
         >>> t.parameters.locate("tasks.sqrt.threads")
         'tasks.sqrt.threads'
@@ -1034,9 +1036,58 @@ class Cado_NFS_toplevel(object):
             # of having set tasks.threads or tasks.sieve.threads,
             # we want to set our default.
             t = min(pa.get_or_set_default("tasks.threads", 0), 2)
+        las_set_by_user = pa.is_set_explicitly("tasks.sieve.las.threads")
         for p in P:
             if not pa.is_set_explicitly(p):
                 pa.set_simple(p, t)
+
+        # The GPU siever (sieve/las-sieve-gpu.cpp): las does best as one
+        # process per GPU, with several subjobs of 2 threads (separate
+        # processes take turns on the GPU, subjobs of one process run
+        # side by side). So each sieving workunit gets the GPU's share of
+        # the threads, and the server hands out at most one sieving
+        # workunit per GPU at a time (CADO_SIEVE_WU_LIMIT, wudb.py); the
+        # other tasks keep their clients. CADO_LAS_GPU_SIEVE=0, or setting
+        # tasks.sieve.las.threads, turns this off.
+        ngpu = self.number_of_gpus_for_las()
+        # tasks.sieve.las.threads=gpu-auto: each las works out its share
+        # of its own node (sieve/las-parallel.cpp: its CPUs / its node's
+        # GPUs, subjobs of 2 threads), for clusters of unlike nodes; the
+        # rest of the GPU layout applies as below
+        las_gpu_auto = las_set_by_user and str(pa.get_or_set_default(
+            "tasks.sieve.las.threads", "")) == "gpu-auto"
+        if ngpu and (las_gpu_auto or (not las_set_by_user
+                                      and not self.args.client_threads
+                                      and self.using_default_parameter_file)):
+            if not las_gpu_auto:
+                tt = int(pa.get_or_set_default("tasks.threads", 0)) or 1
+                per_gpu = max(4, tt // ngpu)
+                # 2-thread subjobs, one per 2 threads: each subjob sieves
+                # a special-q on the GPU while its threads cofactor the
+                # previous one, and many subjobs keep the GPU busy (c120,
+                # 32 threads: Machine,16,2 2.45 s, 16,4 2.60, 8,4 2.71;
+                # 32,1 and 20,2 the same as 16,2)
+                pa.set_simple("tasks.sieve.las.threads",
+                              "Machine,%d,2" % max(1, per_gpu // 2))
+            os.environ["CADO_SIEVE_WU_LIMIT"] = str(ngpu)
+            self.las_gpu_layout = True
+            # each las pays about 0.3 s to start (CUDA context, factor
+            # base): with one workunit per GPU at a time, larger ones
+            # (5 times the parameter file's q-range) waste less of it.
+            # c120: 313 workunits of 1.5 s sieving + 0.3 s start.
+            # A q-range given on the command line is kept.
+            p = "tasks.sieve.qrange"
+            given = any(o.split("=")[0].strip().endswith("qrange")
+                        for o in (self.args.options or []))
+            q = int(pa.get_or_set_default(p, 0) or 0)
+            if q and not given:
+                pa.set_simple(p, 5 * q)
+                self.logger.info("%s=%d for the GPU siever", p, 5 * q)
+            self.logger.info("%d GPU(s) for las: tasks.sieve.las.threads=%s,"
+                             " at most %d sieving workunit(s) at a time"
+                             " per node"
+                             % (ngpu, pa.get_or_set_default(
+                                 "tasks.sieve.las.threads"), ngpu))
 
         # last thing. For sqrt, more than 8 threads is slightly overkill.
         # So unless explicitly stated otherwise, we set it to 1. It might
@@ -1046,10 +1097,13 @@ class Cado_NFS_toplevel(object):
         # about 16Gb per thread).
         p = "tasks.sqrt.threads"
         if not pa.is_set_explicitly(p):
-            self.logger.info(f"Setting {p}=1 in order to avoid RAM issues."
-                             f" You might want to set {p}=<something else>"
-                             " according to what your computer can do.")
-            pa.set_simple(p, 1)
+            # 0: the square root task chooses, from the size of the
+            # dependencies and the available memory (at most 4 at once)
+            self.logger.info(f"Setting {p}=0 (several dependencies at once"
+                             " as memory allows). You might want to set"
+                             f" {p}=<something else> according to what"
+                             " your computer can do.")
+            pa.set_simple(p, 0)
 
         for p in ["tasks.threads",
                   "tasks.polyselect.threads",
@@ -1066,6 +1120,34 @@ class Cado_NFS_toplevel(object):
         for p in ["tasks.linalg.bwc.threads", "tasks.sqrt.threads"]:
             self.logger.info("%s = %s [via %s]"
                              % (p, pa.get_or_set_default(p), pa.locate(p)))
+
+    def number_of_gpus_for_las(self):
+        """ The number of GPUs that las can sieve on: what
+        linalg/bwc/cuda_devices (built with CUDA) says, unless
+        CADO_LAS_GPU_SIEVE=0. """
+        # off as las reads it (atoi: "0", but also "off", "no")
+        v = os.environ.get("CADO_LAS_GPU_SIEVE")
+        if v is not None:
+            m = re.match(r"\s*([+-]?\d+)", v)
+            if not m or int(m.group(1)) == 0:
+                return 0
+        # a cluster whose server node has no GPU (or another number of
+        # them than the sieving nodes): the GPUs of a sieving host
+        e = os.environ.get("CADO_LAS_NGPU")
+        if e is not None and e.strip().isdigit():
+            return int(e)
+        lib = getattr(self, "pathdict", {}).get("lib")
+        if not lib:
+            return 0
+        exe = os.path.join(lib, "linalg", "bwc", "cuda_devices")
+        if not os.access(exe, os.X_OK):
+            return 0
+        try:
+            out = subprocess.run([exe], capture_output=True, text=True,
+                                 timeout=60).stdout.strip()
+            return int(out or 0)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return 0
 
     def set_slaves_parameters(self):
         ''' sets slaves.nrclients and slaves.scriptpath to default values
@@ -1131,7 +1213,13 @@ class Cado_NFS_toplevel(object):
             ts = self.parameters.get_or_set_default(
                     "tasks.sieve.las.threads")
             if t:
-                if isinstance(ts, int) \
+                if getattr(self, "las_gpu_layout", False):
+                    # las uses the whole GPU's share by itself, and the
+                    # server runs one sieving workunit per GPU at a
+                    # time: the clients are for the other tasks
+                    nrclients = int((t + tp - 1)//tp)
+                    self.parameters.set_if_unset("slaves.nrclients", nrclients)
+                elif isinstance(ts, int) \
                    or isinstance(ts, str) and re.match(r'^\d+', ts):
                     ct = max(tp, int(ts))
                     nrclients = int((t + ct - 1)//ct)
@@ -1371,7 +1459,7 @@ class Cado_NFS_toplevel(object):
         tasks.polyselect.threads = 2
         tasks.sieve.las.threads = 2
         tasks.sieve.siqs.threads = 2
-        tasks.sqrt.threads = 1
+        tasks.sqrt.threads = 0
 
         >>> del os.environ["NCPUS_FAKE"]
         '''

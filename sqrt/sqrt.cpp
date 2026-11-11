@@ -68,6 +68,13 @@
 #include "utils_cxx.hpp"
 #include "linalg/bblas/bblas_bitrev.hpp"
 
+/* large products may go to a replacement (the GPU, in sqrt): see
+ * gmp_mul_hook.hpp */
+#include "gmp_mul_hook.hpp"
+#include "sqrt_gpu.hpp"
+#undef mpz_mul
+#define mpz_mul cado_mpz_mul
+
 /* define to check the result of cxx_mpz_polymodF_sqrt */
 // #define DEBUG
 
@@ -2047,8 +2054,12 @@ static int main_(int argc, char const *argv[])
 
     T.check_all_dependency_files_are_ready();
 
+    /* large products on the GPU (CADO_SQRT_GPU=0: GMP only) */
+    sqrt_gpu_init ();
+
     T.do_subtasks_parallel();
 
+    sqrt_gpu_report ();
     print_timing_and_memory (stderr, cpu0, wct0);
     return 0;
 }

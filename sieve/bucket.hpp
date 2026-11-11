@@ -12,6 +12,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+
+#include <algorithm>
 
 #include <vector>
 #include <concepts>
@@ -517,6 +520,23 @@ template <int LEVEL, hint_type HINT> class bucket_array_t
     }
     double max_full(unsigned int * fullest_index = nullptr) const;
     double average_full() const;
+    /* Appends counts[b] updates from src to each bucket b in turn (all
+     * of bucket 0, then all of bucket 1, ...). This is how the GPU fill
+     * (las-fill-gpu.cpp) hands over a slice. An overflowing bucket is not
+     * written past its room, but its write pointer still moves, so that
+     * max_full() sees it and the special-q is redone with more room, as
+     * after an overflow of push_update. */
+    void push_block(update_t const * src, uint32_t const * counts)
+    {
+        for (size_t b = 0; b < n_bucket; b++) {
+            size_t const n = counts[b];
+            ptrdiff_t const room = bucket_start[b + 1] - bucket_write[b];
+            size_t const w = room <= 0 ? 0 : std::min(n, size_t(room));
+            if (w) memcpy(bucket_write[b], src, w * sizeof(update_t));
+            bucket_write[b] += n;
+            src += n;
+        }
+    }
     /* Push an update to the designated bucket. Also check for overflow, if
        SAFE_BUCKET_ARRAYS is defined. */
     inline void push_update(int bucket_number, update_t const & update,

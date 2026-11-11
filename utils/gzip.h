@@ -121,6 +121,13 @@ struct suffix_handler {
     char const * pfmt_out;
 };
 
+/* The command that reads (write == false) or writes a file of this
+ * format: the handler's own, except that .gz files go through pigz when
+ * it is in the PATH (same format; it compresses on all cores and
+ * decompresses about twice as fast as gzip). CADO_NO_PIGZ=1 keeps gzip.
+ * Returns an empty string when the format has no command. */
+extern char const * compression_command(suffix_handler const & r, bool write);
+
 static constexpr suffix_handler supported_compression_formats[] = {
     {
         .suffix = ".gz",
@@ -136,7 +143,7 @@ static constexpr suffix_handler supported_compression_formats[] = {
         /* zstd seems to be uniformly better than any other alternative */
         .suffix = ".zst",
         .pfmt_in = "zstd -dcf {}",
-        .pfmt_out = "zstd -3 > {}",
+        .pfmt_out = "zstd -1 -q > {}",   /* like gzip --fast */
     },
     {
         /* xz is really slow */

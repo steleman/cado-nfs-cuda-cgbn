@@ -19,7 +19,7 @@
  */
 // NOLINTBEGIN(cppcoreguidelines-avoid-non-const-global-variables)
 size_t L1_cachesize = 16384;
-size_t size_tune_sievearray = 8192;
+size_t size_tune_sievearray = 16384; /* see ropt_L1_cachesize */
 // NOLINTEND(cppcoreguidelines-avoid-non-const-global-variables)
 
 

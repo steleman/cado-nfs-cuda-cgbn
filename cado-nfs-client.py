@@ -1510,7 +1510,8 @@ class InputDownloader(object):
             url = self.settings["GETWUPATH"]
             # we could maybe add more options, like architecture, qrange
             # size, whatnot.
-            options = dict(clientid=self.settings["CLIENTID"])
+            options = dict(clientid=self.settings["CLIENTID"],
+                           host=client_host(), ngpu=str(client_ngpu()))
 
             # will not throw, or maybe NoMoreServers
             peer = self.get_missing_file(url,
@@ -1806,6 +1807,44 @@ REQUIRED_SETTINGS = {
                "Base URL for WU server."
                " Can be specified multiple times for failover")
     }
+
+
+def client_host():
+    """ The host name sent with workunit requests: with the GPU siever,
+    the server hands out at most as many sieving workunits at a time to
+    the clients of a host as it has GPUs. CADO_CLIENT_HOST overrides it
+    (testing several "hosts" on one machine). """
+    return os.environ.get("CADO_CLIENT_HOST") or socket.gethostname()
+
+
+_client_ngpu = None
+
+
+def client_ngpu():
+    """ The number of GPUs of this host: CADO_CLIENT_NGPU, else the
+    devices that CUDA_VISIBLE_DEVICES leaves, else nvidia-smi -L; 0 when
+    there is none or nvidia-smi is missing. """
+    global _client_ngpu
+    if _client_ngpu is not None:
+        return _client_ngpu
+    n = 0
+    e = os.environ.get("CADO_CLIENT_NGPU")
+    if e is not None and e.strip().isdigit():
+        n = int(e)
+    else:
+        try:
+            out = subprocess.run(["nvidia-smi", "-L"], capture_output=True,
+                                 text=True, timeout=30).stdout
+            n = sum(1 for line in out.splitlines()
+                    if line.startswith("GPU "))
+        except (OSError, subprocess.SubprocessError):
+            n = 0
+        v = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if v is not None:
+            v = [x for x in v.split(",") if x.strip() != ""]
+            n = min(n, len(v)) if n else 0
+    _client_ngpu = n
+    return n
 
 
 # Optional settings with defaults, overrideable on command line,

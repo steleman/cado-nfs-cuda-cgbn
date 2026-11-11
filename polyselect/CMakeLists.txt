@@ -8,11 +8,28 @@ add_library(polyselect_common
     murphyE.cpp
     area.cpp
     size_optimization.cpp
+    sopt_gpu.cpp
     polyselect_alpha.cpp
     polyselect_norms.cpp
     )
 target_link_libraries (polyselect_common PUBLIC utils)
 cado_apply_pch(polyselect_common)
+if(HAVE_CUDA)
+    # GPU size optimization (size_optimization.cpp): the double
+    # arithmetic must be the CPU's, hence no contraction into FMA
+    add_library(sopt_gpu_kernels STATIC sopt_gpu_kernels.cu)
+    # cado_gpu_claim (utils/gpu_claim.cpp)
+    target_link_libraries(sopt_gpu_kernels PUBLIC utils)
+    set_target_properties(sopt_gpu_kernels PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        CUDA_RUNTIME_LIBRARY Shared)
+    target_compile_options(sopt_gpu_kernels PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-fmad=false -lineinfo>)
+    target_link_libraries(sopt_gpu_kernels PUBLIC CUDA::cudart)
+    target_link_libraries(polyselect_common PUBLIC sopt_gpu_kernels)
+    add_executable(sopt_gpu_test EXCLUDE_FROM_ALL sopt_gpu_test.cpp)
+    target_link_libraries(sopt_gpu_test PRIVATE polyselect_common)
+endif()
 
 # It _seems_ that several polyselect-like libraries share the same
 # general working principle, and that these objects can be treated as a
@@ -38,6 +55,19 @@ add_library(polyselect_middle
     polyselect_stats.c
 )
 target_link_libraries(polyselect_middle PUBLIC polyselect_common ${pthread_libs})
+if(HAVE_CUDA)
+    # GPU collision test (polyselect_collisions.cpp)
+    add_library(polyselect_gpu_kernels STATIC polyselect_gpu_kernels.cu)
+    # cado_gpu_claim (utils/gpu_claim.cpp)
+    target_link_libraries(polyselect_gpu_kernels PUBLIC utils)
+    set_target_properties(polyselect_gpu_kernels PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        CUDA_RUNTIME_LIBRARY Shared)
+    target_compile_options(polyselect_gpu_kernels PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+    target_link_libraries(polyselect_gpu_kernels PUBLIC CUDA::cudart)
+    target_link_libraries(polyselect_middle PUBLIC polyselect_gpu_kernels)
+endif()
 mark_targets_as_openmp(polyselect_middle)
 cado_apply_pch(polyselect_middle)
 
@@ -65,8 +95,22 @@ add_executable (polyselect_ropt
     ropt_str.cpp
     ropt_tree.c
     ropt_sublattice_priority_queue.cpp
+    ropt_gpu.cpp
 )
 target_link_libraries (polyselect_ropt PRIVATE polyselect_common ${pthread_libs})
+if(HAVE_CUDA)
+    # GPU root sieve (ropt_gpu.cpp)
+    add_library(ropt_gpu_kernels STATIC ropt_gpu_kernels.cu)
+    # cado_gpu_claim (utils/gpu_claim.cpp)
+    target_link_libraries(ropt_gpu_kernels PUBLIC utils)
+    set_target_properties(ropt_gpu_kernels PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        CUDA_RUNTIME_LIBRARY Shared)
+    target_compile_options(ropt_gpu_kernels PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+    target_link_libraries(ropt_gpu_kernels PUBLIC CUDA::cudart)
+    target_link_libraries(polyselect_ropt PRIVATE ropt_gpu_kernels)
+endif()
 mark_targets_as_openmp(polyselect_ropt)
 cado_apply_pch(polyselect_ropt)
 
