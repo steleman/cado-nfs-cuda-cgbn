@@ -1,3 +1,11 @@
+Documentation for this fork:
+============================
+
+See [doc-gpu](doc-gpu) in this directory for extensive documentation.
+
+What follows below is the canonical (original) README.md from cado-nfs Upstream.
+
+-----
 
 The main page of the Cado-NFS source code is
 [https://gitlab.com/cado-nfs/cado-nfs](https://gitlab.com/cado-nfs/cado-nfs).
