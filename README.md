@@ -1,7 +1,7 @@
 Documentation for this fork:
 ============================
 
-See [doc-gpu](doc-gpu) in this directory for extensive documentation.
+See [README.GPU.md](README.GPU.md) and [doc-gpu](doc-gpu) in this directory for extensive documentation.
 
 What follows below is the canonical (original) README.md from cado-nfs Upstream.
 
