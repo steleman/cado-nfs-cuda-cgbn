@@ -1,0 +1,7 @@
+# survey_cofactoring_methods -lb 16 -ub 17 -m PP1-65 -b1min 100 -b1max 200 -b1step 100 -cmin 10 -cmax 20 -cstep 10 -seed 1, timings stripped
+# regenerate: REGEN=1 test_strategies_pinned_notime.sh
+PP1-65 0 0 | 16 0.000000 |
+PP1-65 100 1000 | 16 0.603500 |
+PP1-65 200 2000 | 16 0.727273 |
+PP1-65 100 2000 | 16 0.712251 |
+PP1-65 200 4000 | 16 0.796813 |

@@ -1,0 +1,77 @@
+Parameter files for discrete logarithms in GF(p)
+================================================
+
+cado-nfs.py -dlp picks params.pNN, where NN is the number of decimal
+digits of p (or the nearest available size, within 3 digits), and
+params.p2ddNN for GF(p^2). The parameters that DLP shares with
+factoring (polynomial selection, sieving, filtering, linear algebra)
+are documented in parameters/factor/params.c90. The DLP-specific ones
+are:
+
+tasks.reconstructlog.partial
+    passed as -partial to reconstructlog, which then does not
+    reconstruct all the logarithms that it could.
+
+tasks.descent.init_I, init_lim, init_lpb, init_mfb, init_ncurves,
+tasks.descent.init_tkewness
+    parameters of the first step of the descent of a target (see
+    scripts/descent), which looks for a first relation that the rest of
+    the descent can handle. init_tkewness plays the role of qmin for
+    that search.
+
+tasks.descent.I, lim0, lim1, lpb0, lpb1, mfb0, mfb1
+    default sieving parameters of the subsequent descent steps, which
+    the hint file (pNN.hint, see below) refines according to the size
+    of the special-q. I must match the hint file, and lpb0/lpb1 are
+    normally those of the sieving, so that the descent stops at primes
+    whose logarithms are known.
+
+Joux-Lercier polynomial selection
+---------------------------------
+
+The files in Joux-Lercier/ are an alternative set of parameters, for
+the Joux-Lercier polynomial selection (polyselect/dlpolyselect). They
+are not picked automatically; README.dlp explains how to use them.
+They set:
+
+jlpoly = true
+    use dlpolyselect instead of the polynomial selection of factoring.
+
+tasks.polyselect.degree, bound, modm
+    degree is that of the polynomial with small coefficients (the other
+    one has degree one less), bound bounds the size of its
+    coefficients, and modm is the number of workunits the search is
+    split into. bound and modm are passed to dlpolyselect, which
+    requires modm to be coprime to 2*bound*(2*bound+1)*(bound+1).
+
+fastSM = true
+    passes -easySM ell to dlpolyselect, which then favours polynomials
+    that make the Schirokauer maps cheap. This only pays off for small
+    p; above 80 digits or so the sieving and linear algebra dominate.
+
+tasks.sieve.sqside = 0
+    the norms are larger on side 0, which is where the special-q are
+    best taken.
+
+Hint files
+----------
+
+The meaning of hint files is explained in
+
+https://sympa.inria.fr/sympa/arc/cado-nfs/2020-04/msg00019.html
+
+Here is the meaning of a hint file line :
+21@1 1 1 I=11 20000,18,36 20000,18,36
+
+To descend a special-q of 21 bits on side 1, use a sieve with
+I=11
+lim0=lim1=20000
+lpb0=lpb1=18
+mfb0=mfb1=36
+the first block 20000,18,36 corresponding to side0 and the second to
+side1.
+
+The "1 1" in second and third positions can be safely ignored.
+
+Each line gives therefore a rule about how to handle a node in the
+descent tree.

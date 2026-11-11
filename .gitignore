@@ -1,0 +1,6 @@
+build/
+__pycache__/
+*.swp
+CMakeFiles/
+CMakeCache.txt
+result

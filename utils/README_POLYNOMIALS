@@ -1,0 +1,34 @@
+POLYNOMIALS README
+------------------
+
+This file describes the different polynomial implementations present in the
+utils/ directory.
+
+GENERAL DESCRIPTION
+-------------------
+There are currently five families of files: cado_poly, double_poly,
+modul_poly (in utils/arith/), mpz_poly, and polynomial.hpp.
+
+The cado_poly library implements operations on cado_poly structs, which 
+function is to stock the polynomials used for sieving, together with the
+number n and the skewness.
+ 
+The double_poly library (formerly fpoly) implements polynomials with
+floating-point coefficients, including root refining by dichotomy.
+ 
+The modul_poly files implement arithmetic on modular polynomials, with 
+coefficients of the types of the (old) arithmetic layer in utils/arith/.
+
+The mpz_poly files implement polynomials with gmp integers as
+coefficients.
+
+polynomial.hpp defines a C++ class template for polynomials over
+arbitrary types (a priori float, double, and long double).
+
+TODO
+----
+- Write a SPECIFIC DESCRIPTION of the capabilities of the previous 
+implementations.
+- Evaluate overlap and simplify the polynomial implementations as much as 
+possible. 
+

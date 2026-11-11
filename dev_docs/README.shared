@@ -1,0 +1,16 @@
+
+Shared libraries in cado-nfs
+----------------------------
+
+cado-nfs can use dynamically linkable (shared) libraries, but this is
+disabled by default, and must be requested with the ENABLE_SHARED=1
+environment variable. In the particular case of cross-compiling, it is
+preferrable to leave shared libraries disabled in order to avoid the
+annoyance of debugging the related issues. When ENABLE_SHARED is not set,
+gf2x is configured with --disable-shared as well. For a fully static
+build, also set:
+
+LDFLAGS=-static
+
+Extra flags for the gf2x configure script can be passed with
+GF2X_CONFIGURE_EXTRA_FLAGS="whichever;flags;you;want;to;pass;to;gf2x;configure;separated;by;semicolons"

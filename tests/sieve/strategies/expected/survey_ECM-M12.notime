@@ -1,0 +1,7 @@
+# survey_cofactoring_methods -lb 16 -ub 17 -m ECM-M12 -b1min 100 -b1max 200 -b1step 100 -cmin 10 -cmax 20 -cstep 10 -seed 1, timings stripped
+# regenerate: REGEN=1 test_strategies_pinned_notime.sh
+ECM-M12 0 0 | 16 0.000000 |
+ECM-M12 100 1000 | 16 0.805802 |
+ECM-M12 200 2000 | 16 0.882613 |
+ECM-M12 100 2000 | 16 0.881834 |
+ECM-M12 200 4000 | 16 0.939850 |

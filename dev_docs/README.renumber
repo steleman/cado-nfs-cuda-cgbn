@@ -1,0 +1,78 @@
+Some explanations on the format of the renumbering table.
+
+
+1. Format of the file
+2. Given an ideal (p,r) on side s, how do I find its index in the table ?
+3. Given an index in the table (and the polynomial pair), how do I find the
+   corresponding ideal ?
+
+
+0. Convention
+=============
+
+A rational ideal above p is represented by (p,r) where r does not matter
+(renumber_t::p_r_from_index returns r=0).
+A projective ideal above p is represented by (p,p).
+
+1. Format of the file
+=====================
+
+The format of the file is described in filter/README.fileformat
+
+Two formats exist. Both begin with the same text header, whose first
+non-comment line is the format number.
+
+ - 20220411 ("flat"): the table follows the header as text, one "p vr"
+   pair per line, in decimal.
+
+ - 20260919 ("binary", the default since then): the header is the one
+   above, followed by one last line giving the offset of the table in
+   the file, the size in bytes of one of the two values of an entry (4
+   or 8, depending on SIZEOF_P_R_VALUES on the machine that wrote the
+   file), and the byte order ('L' or 'B'). That line is padded with
+   spaces so that it ends exactly where the table begins, which is a
+   multiple of 4096; a reader that cannot seek gets to the table by
+   reading that line to its end. The table itself follows as pairs of
+   integers in machine representation.
+
+   A file in this format that is not compressed, and whose entries
+   have the width this binary was compiled for, is mmapped rather than
+   read. Otherwise it is read and converted.
+
+   Files written between 2026-09-19 and 2026-10-17 carry the number
+   20250919 instead. It is accepted as a synonym.
+
+
+2. Given an ideal (p,r) on side s, how do I find its index in the table ?
+=========================================================================
+
+* Compute vr
+    vr = (nsides - 1)*(p + 1) if s is the rational side
+    vr = s'*(p + 1) + r otherwise, where s' is the number of non-rational
+         sides below s (with one rational side and two sides, vr = r)
+
+* Find the entry j of the table such that table[j] = (p, vr). All entries
+  for a given p are contiguous, and p is non-decreasing in the table.
+
+* The index of the ideal of (p,r) on side s is j + above_bad, where
+  above_bad is the number of additional columns plus the total number of
+  bad ideals (it is also given in the header, by the comment line
+  "# renumber table for all indices above ...").
+  Bad ideals and additional columns have indices below above_bad.
+
+This is renumber_t::index_from_p_r in utils/renumber.cpp.
+
+
+3. Given an index in the table (and the polynomial pair), how do I find the
+   corresponding ideal ?
+===========================================================================
+
+* Let (p, vr) = table[i - above_bad]
+
+* Let r = vr. For each non-rational side s, in increasing order:
+    if r <= p, the ideal is (p,r) on side s ; stop.
+    otherwise, r = r - (p + 1)
+
+* If r = 0 at the end, the ideal is the one above p on the rational side.
+
+This is renumber_t::p_r_from_index in utils/renumber.cpp.

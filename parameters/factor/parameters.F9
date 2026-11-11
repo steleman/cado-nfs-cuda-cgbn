@@ -1,0 +1,43 @@
+# An example parameter file for an SNFS factorization, in this case, F9 = 2^512+1 = 2424833*N
+
+name = F9
+N = 5529373746539492451469451709955220061537996975706118061624681552800446063738635599565773930892108210210778168305399196915314944498011438291393118209
+
+tasks.lim0 = 2300000
+tasks.lim1 = 1200000
+tasks.lpb0 = 26
+tasks.lpb1 = 26
+
+# We supply the SNFS polynomial, so we don't want any polynomial selection
+# to happen. Since we import the polynomial (see below), no polynomial
+# selection is run, but admax and adrange must still be set.
+tasks.polyselect.admin = 0
+tasks.polyselect.admax = 0
+tasks.polyselect.adrange = 0
+# This instructs the polyselect task to import the polynomial in the file
+# F9.poly. The imported polynomial is used unconditionally: both phases of
+# polynomial selection are skipped.
+tasks.polyselect.import = parameters/polynomials/F9.poly
+
+# Sieving parameters which seem ok for this number.
+# For SNFS numbers, choosing sieving parameters is a bit trickier than for
+# GNFS, because they depend on more than just the input number size. For
+# example, using an algebraic factor in the number may force using a somewhat
+# larger or smaller degree (say, 6 or 4) than one would like. The
+# algebraic polynomial might have only very small coefficients, or might
+# contain a large coefficient or two... and without knowing how large the
+# norms on the two sides are, one cannot suggest good sieving parameters.
+# These parameters happen to work alright for F9, though.
+tasks.sieve.mfb0 = 52
+tasks.sieve.mfb1 = 52
+tasks.sieve.lambda0 = 2.1
+tasks.sieve.lambda1 = 2.2
+tasks.I = 12
+tasks.qmin = 2000000
+tasks.sieve.qrange = 5000
+tasks.sieve.sqside = 0
+
+# linear algebra
+tasks.linalg.m = 64
+tasks.linalg.n = 64
+tasks.linalg.characters.nchar = 50

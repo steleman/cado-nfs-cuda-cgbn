@@ -1,0 +1,35 @@
+#ifndef CADO_SELECT_BEST_STRATEGIES_HPP
+#define CADO_SELECT_BEST_STRATEGIES_HPP
+
+#include <istream>
+#include <optional>
+#include <ostream>
+#include <string>
+#include <vector>
+
+#include "build_strategies.hpp" // strategy_matrix
+#include "cofactoring_strategy.hpp"
+
+/* How many times each pair of cofactor sizes was seen, as las reports it
+ * with -stats-cofact. */
+using cofactor_distribution = std::vector<std::vector<unsigned long>>;
+
+/* One chosen strategy per pair of sizes, empty where the distribution
+ * never saw that pair. */
+using best_strategies = std::vector<std::vector<std::optional<cofactoring_strategy>>>;
+
+strategy_matrix extract_matrix_strat(std::string const & pathname_st,
+                                     unsigned int len_abs, unsigned int len_ord);
+
+cofactor_distribution extract_matrix_C(std::istream & is, unsigned int len_abs,
+                                       unsigned int len_ord);
+
+best_strategies compute_best_strategy(strategy_matrix const & matrix_strat,
+                                      cofactor_distribution const & distrib_C,
+                                      unsigned int len_abs,
+                                      unsigned int len_ord, double C0);
+
+void fprint_final_strategy(std::ostream & os, best_strategies const & res,
+                           unsigned int len_abs, unsigned int len_ord);
+
+#endif /* CADO_SELECT_BEST_STRATEGIES_HPP */

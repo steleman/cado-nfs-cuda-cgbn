@@ -1,0 +1,93 @@
+Pinned input files for the sieve/strategies tests
+=================================================
+
+Both files below are in the format that survey_cofactoring_methods and
+bench_cofactoring_methods write and that build_cofactoring_strategies reads:
+one line per factoring method,
+
+    method B1 B2 | p proba_p proba_(p+1) ... | c1 c2 c3 c4 |
+
+(see sieve/strategies/README for the meaning of the columns). A line
+starting with '#' is a comment, in this format and in the two others that
+this directory reads -- the factorization patterns and the strategies --
+so the references under expected/ label each of their sections with one
+and remain valid input for the reader that produced them.
+
+They are pinned rather than produced on the fly because
+bench_cofactoring_methods measures wall-clock time, so the
+survey_cofactoring_methods/bench_cofactoring_methods chain does not give the
+same output twice even at a fixed -seed.
+
+Each of the two carries its own provenance in a comment header: what it is,
+how it was produced, and what to beware of when reading it. That is where to
+look, and where to keep it up to date -- not here.
+
+sample_methods.txt is hand-written and covers the six method families;
+data_fm_25.txt is cado's own default strategy benched for fbb = 25.
+
+
+expected/ -- the pinned outputs
+===============================
+
+test_strategies_pinned.sh and test_strategies_pinned_notime.sh compare what
+the binaries produce against the references in expected/. Each reference
+begins with a comment naming the command that produced it, written by the
+script from the same place that runs that command, so the two cannot drift
+apart; there is deliberately no list of them here. Both scripts take REGEN=1
+to rewrite the references in place, which is how they were made and how they
+should be remade after a deliberate change of behaviour -- read the diff
+before committing it.
+
+The instance is small enough that the whole thing runs in well under a
+second. One thing about it is worth stating here because no single file
+shows it: fbb = ceil(log2(lim+1)) = 11 for the lim used, so a cofactor of
+fewer than 2*fbb-1 = 21 bits is taken to be prime and gets a trivial
+strategy. The band [21, 26] is where the generator does work, and it is
+where the references are taken.
+
+Two things are deliberately not pinned:
+
+  - survey_cofactoring_methods -ch. The convex hull ranks methods by
+    (probability, time), so timing noise changes which methods survive:
+    eight runs at one seed gave three different answers, with hulls of two
+    different sizes. It is smoke-checked only, and the same hull code is
+    pinned through -fch, which reads a fixed file.
+
+  - the timing columns of anything survey_cofactoring_methods or
+    bench_cofactoring_methods writes. Those are wall-clock measurements and
+    never come out the same twice; the references with a .notime suffix have
+    them stripped before the comparison.
+
+Where these references are valid
+================================
+
+They were produced on x86-64 with gcc, and the two scripts only run where
+that arithmetic is reproducible. CMake guards them; if they do not appear
+in the ctest list, this is why.
+
+  - Byte-exact pinning needs a double to be a double. On i386 with x87
+    arithmetic, which is what gcc selects for -m32 unless told
+    -mfpmath=sse, intermediates keep 80 bits, and a decision taken on two
+    quantities that agree to the last bit goes the other way.
+    choose_cofactoring_strategies bisects for the slope at which to read
+    the trade-off frontier, stopping at 1e-4; where two strategies are
+    near-tied at that slope, the two builds pick different ones. They are
+    just as good, but they are not the same ones, and since what differs
+    is a choice and not a digit, no tolerance in the comparison would
+    absorb it. config/excess-precision.cpp is the test, via
+    FLT_EVAL_METHOD.
+
+    Everything before that step -- the patterns, the one-sided
+    strategies, the merge, the whole matrix and its digest -- does agree
+    between the two builds.
+
+  - The .notime references need a 64-bit unsigned long as well.
+    survey_cofactoring_methods draws the sizes of its random composites
+    through random_uniform(), which consumes ULONG_MAX worth of randomness
+    per call, so a fixed -seed does not give the same stream on a 32-bit
+    build, and the methods surveyed differ. That is a property of
+    random_uniform() in utils, not of this directory.
+
+Both are checks on the reference, not on the code: a 32-bit build computes
+strategies that are just as good, and everything else in this directory
+passes there.

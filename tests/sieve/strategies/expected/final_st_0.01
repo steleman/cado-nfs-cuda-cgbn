@@ -1,0 +1,27 @@
+# choose_cofactoring_strategies -st <that matrix> -dist <fixed> -t 0.01 -mfb0 26 -mfb1 26
+# regenerate: REGEN=1 test_strategies_pinned.sh
+d = {
+    PM1 100 1000
+    PP1-27 150 3000
+    ECM-M12 150 3000
+    ECM-M12 150 3000
+    ECM-M12 150 3000
+}
+d1 = {
+    PM1 100 1000
+    ECM-B12 100 1000
+    ECM-M12 150 3000
+    ECM-M12 150 3000
+}
+21 21: { 1: d1 0: d1 }
+21 23-24: { 1: d1 0: d1 }
+21 26: { 1: d 0: d1 }
+23 21: { 0: d1 1: d1 }
+23 23-24: { 1: d1 0: d1 }
+23-24 26: { 1: d 0: d1 }
+24 21: { 0: d1 1: d1 }
+24 23: { 0: d1 1: d1 }
+24 24: { 1: d1 0: d1 }
+26 21: { 0: d 1: d1 }
+26 23-24: { 0: d 1: d1 }
+26 26: { 1: d 0: d }

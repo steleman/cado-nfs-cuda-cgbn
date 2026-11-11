@@ -1,0 +1,3 @@
+# sha256 over all 729 cells of that matrix
+# regenerate: REGEN=1 test_strategies_pinned.sh
+cc3e81d72fb2f5038dac8d6bfb209f4b5267dc674d29b451c523d48e27b6cd6e

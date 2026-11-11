@@ -1,0 +1,741 @@
+#include "cado.h" // IWYU pragma: keep
+
+#include <cfloat>
+#include <climits>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+
+#include <gmp.h>
+
+#include <algorithm>
+#include <array>
+#include <set>
+#include <utility>
+
+#include "convex_hull.hpp"
+#include "cxx_mpz.hpp"
+#include "facul.hpp"
+#include "facul_strategies.hpp"
+#include "facul_ecm.h"
+#include "cofactoring_method.hpp"
+#include "cofactoring_method_bench.hpp"
+#include "random_distributions.hpp"
+#include "macros.h"
+#include "utils_cxx.hpp"
+#include "cofactoring_strategy.hpp"
+#include "arith/modredc_15ul.h" // MODREDC15UL_MAXBITS
+#include "arith/modredc_2ul2.h" // MODREDC2UL2_MAXBITS
+#include "arith/modredc_ul.h"   // MODREDCUL_MAXBITS
+#include "timing.h"       // microseconds
+
+/* How many curves of one family a measurement is spread over. */
+size_t const NB_CURVES_PER_MEASUREMENT = 8;
+
+/*
+   The test fails with probabily equals to 1/4^15 (approx 0) (MILLER RABIN).
+*/
+int const NB_PRIMALITY_TEST = 15;
+
+double const EPSILON_DBL = LDBL_EPSILON;
+
+/*
+  If the probability to find a prime number of p bits is less than 3%,
+  we can suppose that the probability to find p+i bits (i>0) is equal to 0.
+*/
+double const BENCH_MIN_PROBA = 0.03;
+
+/************************************************************************/
+/*                      To generate numbers n=pq                        */
+/************************************************************************/
+
+/*
+  this function allows to compute an array with the probability of
+  scoring of each size of prime number in [min, ..., max].
+ */
+std::vector<double> distribution_prime_number(int min, int max)
+{
+    int const len = max - min + 1;
+    ASSERT(len >= 0);
+
+    std::vector<double> tab(len);
+
+    unsigned long elem = pow(2, min);
+    int log_elem = min;
+    for (int i = 0; i < len; i++) {
+        tab[i] = (elem - 1) / log_elem;
+        elem *= 2;
+        log_elem++;
+    }
+
+    double proba = 1;
+    double sum = 0;
+    for (int i = 0; i < len; i++) {
+        tab[i] *= proba;
+        proba /= 2;
+        sum += tab[i];
+    }
+
+    ASSERT(sum != 0);
+    for (int i = 0; i < len; i++)
+        tab[i] /= sum;
+
+    return tab;
+}
+
+/*
+  This function generates in 'res' a random prime number of 'lenFact' bits.
+*/
+
+cxx_mpz generate_prime_factor(gmp_randstate_t state, int lenFact)
+{
+    cxx_mpz min, res;
+    mpz_ui_pow_ui(min, 2, lenFact - 1);
+    for (;;) {
+        mpz_urandomm(res, state, min);
+        mpz_add(res, res, min);
+        if (mpz_probab_prime_p(res, NB_PRIMALITY_TEST))
+            return res;
+    }
+}
+
+/*
+  This function generates in 'res' a random composite number of 'lenFactall'
+  bits with a prime factor of 'lenFact1' bits.
+*/
+cxx_mpz generate_composite_integer(gmp_randstate_t state, int lenFact1,
+                                   int lenFactall)
+{
+    cxx_mpz res;
+    mpz_t bound_max, bound_min;
+    mpz_init(bound_max);
+    mpz_init(bound_min);
+    mpz_ui_pow_ui(bound_min, 2, lenFactall - 1); // 2^(lenfactall)
+    mpz_mul_ui(bound_max, bound_min, 2);
+    mpz_sub_ui(bound_max, bound_max, 1); // 2^(lenfactall+1)-1
+    do {
+        cxx_mpz p = generate_prime_factor(state, lenFact1);
+        cxx_mpz q = generate_prime_factor(state, lenFactall - lenFact1);
+        mpz_mul(res, q, p);
+    } while (mpz_cmp(bound_min, res) > 0 || mpz_cmp(bound_max, res) < 0);
+
+    mpz_clear(bound_max);
+    mpz_clear(bound_min);
+    return res;
+}
+
+/*
+  This function generates in 'res' a random composite number of 'lenFactall'
+  bits with a prime factor where this size depends to the distrubution
+  of prime numbers (in 'dist')!
+*/
+cxx_mpz generate_composite_integer_interval(gmp_randstate_t state,
+                                            std::vector<double> const & dist,
+                                            int lenFact1_min, int lenFactall)
+{
+    unsigned int const index = random_categorical(state, dist);
+    return generate_composite_integer(state, lenFact1_min + int(index),
+                                      lenFactall);
+}
+
+/************************************************************************/
+/*                To model our factoring methods                        */
+/************************************************************************/
+
+std::vector<facul_strategy_oneside> generate_fm(facul_method_code method,
+                                                unsigned long B1,
+                                                unsigned long B2,
+                                                ec_parameterization_t curve)
+{
+    /* B = 0 so that nothing is assumed prime, lpb = UINT_MAX so that
+     * nothing is rejected as too large: what we measure is "did this
+     * method find a factor", not "is this number smooth". */
+    auto const one = [](facul_method::parameters const & m) {
+        return facul_strategy_oneside {0UL, UINT_MAX, 0U, {m}, 0};
+    };
+
+    /* facul_method is move-only, so this is built by push_back rather
+     * than from an initializer list, which would copy. */
+    std::vector<facul_strategy_oneside> res;
+    res.reserve(NB_CURVES_PER_MEASUREMENT);
+
+    if (method != EC_METHOD) {
+        res.push_back(one(facul_method::parameters {method, B1, B2}));
+        return res;
+    }
+
+    /* The first parameters of the sequence are the exceptional ones,
+     * which find more primes than the rest; a method named without a
+     * parameter means a generic curve, so they are skipped. Which
+     * generic parameters we take does not matter -- they are
+     * indistinguishable -- but spreading several of them over the
+     * samples measures the family rather than one member of it. */
+    std::set<unsigned long> seen;
+    unsigned long const first = ec_parameterization_nexceptional(curve);
+    for (size_t i = 0; i < NB_CURVES_PER_MEASUREMENT; i++) {
+        unsigned long const p =
+            ec_valid_parameter_from_sequence(curve, first + i);
+        /* a family may hold fewer curves than we asked for: MONTY16 is
+         * a single one */
+        if (!seen.insert(p).second)
+            break;
+        res.push_back(one(facul_method::parameters {method, B1, B2, curve, p, 1}));
+    }
+    ASSERT_ALWAYS(!res.empty());
+    return res;
+}
+
+/************************************************************************/
+/*            BENCH THE PROBABILITY AND TIME OF OUR METHODS             */
+/************************************************************************/
+
+/*
+  This function collects the probability of success to find a prime number
+  (of 'len_p' bits) in a composite number (of 'len_n' bits)
+  with this method.
+*/
+
+double bench_proba_fm(std::vector<facul_strategy_oneside> const & curves,
+                      gmp_randstate_t state, unsigned long len_p,
+                      unsigned long len_n, std::vector<cxx_mpz> & N,
+                      size_t nb_test_max)
+{
+    size_t nb_success_max = 1000, nb_success = 0;
+    size_t nb_test = 0;
+    std::vector<cxx_mpz> f;
+
+    while (nb_success < nb_success_max && (nb_test < nb_test_max)) {
+        /*
+           f will contain the prime factor of N that the method
+           found.  Note that N is composed by two prime factors by the
+           previous function.
+        */
+        f.clear();
+        if (nb_test == N.size())
+            N.push_back(generate_composite_integer(state, len_p, len_n));
+
+        /* a different curve of the family for each sample */
+        auto res = facul(N[nb_test], curves[nb_test % curves.size()]);
+
+        nb_success += res.status != FACUL_MAYBE;
+        nb_test++;
+    }
+
+    return nb_success / ((double)nb_test);
+}
+
+double bench_time_fm_onelength(std::vector<facul_strategy_oneside> const & curves,
+                               std::vector<cxx_mpz> & N, size_t nb_test)
+{
+    double tps = 0;
+
+    uint64_t starttime, endtime;
+    starttime = microseconds();
+
+    for (size_t i = 0; i < nb_test; i++) {
+        auto f = facul(N[i], curves[i % curves.size()]);
+    }
+
+    endtime = microseconds();
+    tps += endtime - starttime;
+
+    return tps / ((double)nb_test);
+}
+
+/*
+  This function allows to collect for each factoring methods,
+  the probability to find a prime number of a certain size,
+  from 'len_p_min' until the probability become null.
+*/
+
+void bench_proba(gmp_randstate_t state, cofactoring_method_list & fm, int len_p_min,
+                 int p_max, size_t nb_test_max)
+{
+    if (p_max == 0)
+        p_max = 100;
+    if (nb_test_max == 0)
+        nb_test_max = 10000;
+
+    // Will contain our composite integers
+    std::vector<std::vector<cxx_mpz>> N(p_max);
+
+    for (auto & elem: fm) {
+        auto const & params = elem.params;
+
+        std::vector<double> proba;
+        if (params.is_null()) {
+            /* A null method finds nothing, and there is no plan to build
+             * for it: ecm_make_plan() does not survive B1 = 0 for a
+             * twisted Edwards parameterization, where the bytecode
+             * encoder asserts on it. bench_time() already skips it. */
+            proba.push_back(0);
+        } else {
+            auto const curves = generate_fm(params.method, params.B1,
+                                           params.B2,
+                                           params.parameterization);
+            do {
+                int const len_p = len_p_min + int(proba.size());
+                int const len_n = 60 + len_p;
+                proba.push_back(bench_proba_fm(curves, state, len_p, len_n,
+                                               N[proba.size()], nb_test_max));
+            } while ((proba.back() - BENCH_MIN_PROBA) > EPSILON_DBL &&
+                     int(proba.size()) < p_max);
+        }
+
+        elem.len_p_min = len_p_min;
+        elem.proba = std::move(proba);
+    }
+}
+
+/*
+  This function allows to collect for each factoring methods, the
+  differents time to find a prime number in an integer of different
+  bits size (MODREDCUL_MAXBITS, MODREDC15UL_MAXBITS,
+  MODREDC2UL2_MAXBITS and MODREDC2UL2_MAXBITS+30).
+*/
+void bench_time(gmp_randstate_t state, cofactoring_method_list & fm, size_t nb_test)
+{
+    if (nb_test == 0)
+        nb_test = 100000;
+    std::vector<cxx_mpz> N1, N2, N3, N4;
+    N1.reserve(nb_test);
+    N2.reserve(nb_test);
+    N3.reserve(nb_test);
+    N4.reserve(nb_test);
+    for (size_t i = 0; i < nb_test; i++) {
+        N1.push_back(generate_prime_factor(state, MODREDCUL_MAXBITS));
+        N2.push_back(generate_prime_factor(state, MODREDC15UL_MAXBITS));
+        N3.push_back(generate_prime_factor(state, MODREDC2UL2_MAXBITS));
+        N4.push_back(generate_prime_factor(state, MODREDC2UL2_MAXBITS + 30));
+    }
+    for (auto & elem: fm) {
+        auto const & params = elem.params;
+        if (params.B1 != 0 || params.B2 != 0) {
+            auto const curves = generate_fm(params.method, params.B1,
+                                           params.B2,
+                                           params.parameterization);
+            elem.time = {bench_time_fm_onelength(curves, N1, nb_test),
+                         bench_time_fm_onelength(curves, N2, nb_test),
+                         bench_time_fm_onelength(curves, N3, nb_test),
+                         bench_time_fm_onelength(curves, N4, nb_test)};
+        } else {
+            elem.time = {0, 0, 0, 0};
+        }
+    }
+}
+
+/************************************************************************/
+/*       BENCH according to an interval of size of prime numbers        */
+/************************************************************************/
+
+/*
+   This function returns default parameters for the collection of
+   factoring methods, res, such that:
+   res[0]=b1_min
+   res[1]=b1_max
+   res[2]=b1_step
+   res[3]=c_min
+   res[4]=c_max
+   res[5]=c_step
+   TODO: these parameters will be improved :)
+*/
+std::array<int, 6> choice_parameters(facul_method_code method, int len_p_min)
+{
+    int b1_min, b1_max, b1_step, c_min, c_max, c_step;
+    if (method == PM1_METHOD || method == PP1_27_METHOD ||
+        method == PP1_65_METHOD) {
+        if (len_p_min < 20) {
+            b1_min = 20;
+            b1_max = 1000;
+            b1_step = 10;
+            c_min = 10;
+            c_max = 50;
+            c_step = 5;
+        } else if (len_p_min <= 25) {
+            b1_min = 20;
+            b1_max = 4500;
+            b1_step = 20;
+            c_min = 40;
+            c_max = 80;
+            c_step = 5;
+        } else if (len_p_min < 30) {
+            b1_min = 100;
+            b1_max = 10000;
+            b1_step = 50;
+            c_min = 20;
+            c_max = 200;
+            c_step = 10;
+        } else {
+            b1_min = 100;
+            b1_max = 30000;
+            b1_step = 100;
+            c_min = 20;
+            c_max = 500;
+            c_step = 10;
+        }
+
+    } else if (method == EC_METHOD) {
+        if (len_p_min < 20) {
+            b1_min = 20;
+            b1_max = 5000;
+            b1_step = 10;
+            c_min = 10;
+            c_max = 100;
+            c_step = 10;
+        } else if (len_p_min <= 25) {
+            b1_min = 100;
+            b1_max = 10000;
+            b1_step = 10;
+            c_min = 10;
+            c_max = 200;
+            c_step = 40;
+        } else if (len_p_min < 30) {
+            b1_min = 100;
+            b1_max = 13000;
+            b1_step = 100;
+            c_min = 10;
+            c_max = 500;
+            c_step = 20;
+        } else {
+            b1_min = 200;
+            b1_max = 30000;
+            b1_step = 100;
+            c_min = 10;
+            c_max = 1000;
+            c_step = 20;
+        }
+
+    } else {
+        throw cado::error("no default parameters for method {}", int(method));
+    }
+    return { b1_min, b1_max, b1_step, c_min, c_max, c_step };
+}
+
+/*
+  This function allows to compute the probability and the time of a method
+  to find a prime number in an interval [2**len_p_min, 2**len_p_max].
+*/
+static weighted_success
+bench_proba_time_pset_onefm(std::vector<facul_strategy_oneside> const & curves,
+                            std::vector<cxx_mpz> & N, size_t nb_test_max)
+{
+    size_t nb_succes_lim = 1000, nb_succes = 0;
+    size_t nb_test = 0;
+
+    double starttime, endtime;
+    starttime = microseconds();
+
+    std::vector<cxx_mpz> f;
+
+    while ((nb_succes < nb_succes_lim) && (nb_test < nb_test_max)) {
+        // computes the time of execution
+        f.clear();
+        ASSERT_ALWAYS(nb_test < N.size());
+        auto f = facul(N[nb_test], curves[nb_test % curves.size()]);
+        nb_succes += f.status != FACUL_MAYBE;
+        nb_test++;
+    }
+    endtime = microseconds();
+    double const tps = endtime - starttime;
+
+    return weighted_success(nb_succes, tps, nb_test);
+}
+
+/*
+  This function returns an array which contains, for each method,
+  the probability and the cost to find a prime number for each size between
+  'len_p_min' and 'len_p_max'. The type of these methods is specified by
+  two parameters : 'method' and 'curve', and the parameters B1 and B2 are
+  given by 'param_region' or, if it's equal to nullptr, use the default sieve.
+*/
+
+cofactoring_method_list bench_proba_time_pset(facul_method_code method,
+                                     ec_parameterization_t curve,
+                                     gmp_randstate_t state, int len_p_min,
+                                     int len_p_max, int len_n,
+                                     int const * param_region)
+{
+    // define the sieve region
+    int c_min, c_max;
+    int b1_min, b1_max;
+    int c_step, b1_step;
+    if (param_region != nullptr) {
+        b1_min = param_region[0];
+        b1_max = param_region[1];
+        b1_step = param_region[2];
+
+        c_min = param_region[3];
+        c_max = param_region[4];
+        c_step = param_region[5];
+    } else {
+        // default parameters for the sieve region.
+        auto const param = choice_parameters(method, len_p_min);
+        b1_min = param[0];
+        b1_max = param[1];
+        b1_step = param[2];
+
+        c_min = param[3];
+        c_max = param[4];
+        c_step = param[5];
+    }
+
+    //{{Will contain the our composite integers!
+    int const nb_test_max = 10000;
+    std::vector<cxx_mpz> N;
+    auto const disp = distribution_prime_number(len_p_min, len_p_max);
+    N.reserve(nb_test_max);
+    for (int i = 0; i < nb_test_max; i++) {
+        /* generation of the integers N[i] (which will be
+           factoring). To avoid to waste time, we precompute these
+           values only one time
+        */
+        N.push_back(
+            generate_composite_integer_interval(state, disp, len_p_min, len_n));
+    }
+    //}}
+
+    cofactoring_method_list tab_fusion;
+
+    // add zero method
+    {
+        cofactoring_method z = cofactoring_method::from_fields(method, curve, 0, 0);
+        z.len_p_min = len_p_min;
+        z.proba = {0};
+        z.time = {0};
+        tab_fusion.push_back(std::move(z));
+    }
+
+    for (int c = c_min; c <= c_max; c += c_step) {
+        int B1 = b1_min;
+        int B2 = B1 * c;
+
+        double proba = 0;
+        double const max_proba = 0.9;
+
+        while (B1 <= b1_max && proba < max_proba) {
+            auto const curves = generate_fm(method, B1, B2, curve);
+            weighted_success const res =
+                bench_proba_time_pset_onefm(curves, N, nb_test_max);
+            proba = res.prob;
+
+            cofactoring_method elem =
+                cofactoring_method::from_fields(method, curve, B1, B2);
+            elem.len_p_min = len_p_min;
+            elem.proba = {proba};
+            elem.time = {res.time};
+            tab_fusion.push_back(std::move(elem));
+
+            B1 = B1 + b1_step;
+            B2 = B1 * c;
+        }
+    }
+    return tab_fusion;
+}
+
+/************************************************************************/
+/*                     GENERATE FACTORING METHODS                       */
+/************************************************************************/
+
+/*
+  This function returns for each sub-interval of prime number, the probability
+  and the time to find a prime number in N (an integer of len_n bits).
+  With this function, we can specify the method, the curve and the sieve
+  region of parameters for B1 and B2. Note that an option 'opt_ch'
+  allows to apply the selection by convex hull.
+*/
+cofactoring_method_list generate_factoring_methods_mc(
+    gmp_randstate_t state, int len_p_min, int len_p_max, int len_n,
+    facul_method_code method, ec_parameterization_t curve, int opt_ch,
+    int const * param_sieve)
+{
+    ASSERT(len_p_min <= len_p_max);
+
+    cofactoring_method_list collect = bench_proba_time_pset(
+        method, curve, state, len_p_min, len_p_max, len_n, param_sieve);
+
+    if (opt_ch)
+        return convex_hull_fm(collect);
+    return collect;
+}
+
+/*
+  This function calls the previous function (generate_factoring_methods_mc ())
+  for each one of our functions.
+*/
+
+cofactoring_method_list generate_factoring_methods(gmp_randstate_t state, int len_p_min,
+                                      int len_p_max, int len_n, int opt_ch,
+                                      int const * param_sieve)
+{
+    cofactoring_method_list res;
+
+    for (auto const & f: facul_method_families()) {
+        /* The curve of a non-ECM method is meaningless, but it is written
+         * out all the same, and MONTY12 is what this sweep has always put
+         * there. Normalising it is a separate change. */
+        ec_parameterization_t const curve =
+            f.method == EC_METHOD ? f.parameterization : MONTY12;
+
+        printf("method = %d, curve = %d\n", f.method, curve);
+        cofactoring_method_list const one = generate_factoring_methods_mc(
+            state, len_p_min, len_p_max, len_n, f.method, curve, opt_ch,
+            param_sieve);
+
+        res.insert(res.end(), one.begin(), one.end());
+    }
+
+    return res;
+}
+
+/************************************************************************/
+/*                    MERGE and compute the convex hull                 */
+/************************************************************************/
+/*
+  This function collects factoring methods from the file 'file_in'
+  and make a selection by convex hull and prints them in file_out.
+ */
+cofactoring_method_list convex_hull_from_file(std::istream & in, std::ostream & out)
+{
+    cofactoring_method_list all_st;
+    if (!(in >> all_st))
+        throw cado::error("Cannot read the factoring methods");
+
+    cofactoring_method_list res = convex_hull_fm(all_st);
+
+    if (!(out << res))
+        throw cado::error("Cannot write the factoring methods");
+
+    return res;
+}
+
+/************************************************************************/
+/*                      FILTERING                                       */
+/************************************************************************/
+
+/*
+filtering: most homegenous method that allows to keep
+methods of differents probabilities. With a classic version, the
+remaining methods tend to have very high probabilities, and it's not
+necessarily that we want!
+*/
+cofactoring_method_list filtering(cofactoring_method_list const & tab, int final_nb_methods)
+{
+    size_t const nb_methods = tab.size();
+
+    /* The trade-off of a method at each probability index.
+     *
+     * Note that the index into time[] is computed from the probability
+     * index, not from a bit size; with the usual ten-odd probabilities
+     * that always lands on time[0]. It is kept that way, clamped to what
+     * time[] actually holds. */
+    auto tradeoff = [](cofactoring_method const & el) {
+        std::vector<double> c(el.proba.size());
+        for (size_t p = 0; p < el.proba.size(); p++) {
+            if (el.proba[p] > EPSILON_DBL) {
+                size_t i = cofactoring_method::time_index((unsigned int) p);
+                if (i >= el.time.size())
+                    i = el.time.size() - 1;
+                c[p] = el.time[i] / el.proba[p];
+            } else { // the zero method
+                c[p] = 0;
+            }
+        }
+        return c;
+    };
+
+    // the average distance between each pair of methods
+    std::vector<std::vector<double>> dist(nb_methods,
+                                          std::vector<double>(nb_methods, 0));
+    for (size_t i = 0; i < nb_methods; i++) {
+        auto const compromis_i = tradeoff(tab[i]);
+        for (size_t j = i + 1; j < nb_methods; j++) {
+            auto const compromis_j = tradeoff(tab[j]);
+
+            double moy_dist = 0;
+            size_t const nb_elem =
+                std::min(compromis_i.size(), compromis_j.size());
+            for (size_t p = 0; p < nb_elem; p++) {
+                double const tmp = compromis_i[p] - compromis_j[p];
+                moy_dist += tmp * tmp;
+            }
+            moy_dist = sqrt(moy_dist) / double(nb_elem);
+
+            dist[i][j] = moy_dist;
+            dist[j][i] = moy_dist;
+        }
+    }
+
+    // sort the pairs of methods by distance
+    // todo: improve this method! For now, it's a naive method.
+    std::vector<std::pair<size_t, size_t>> sort_dist;
+    sort_dist.reserve(nb_methods * (nb_methods - 1) / 2);
+    while (sort_dist.size() < nb_methods * (nb_methods - 1) / 2) {
+        size_t i_min = 0, j_min = 0;
+        bool found = false;
+        double ratio = INFINITY;
+        for (size_t i = 0; i < nb_methods; i++) {
+            for (size_t j = i + 1; j < nb_methods; j++) {
+                if (dist[i][j] < ratio) {
+                    i_min = i;
+                    j_min = j;
+                    ratio = dist[i][j];
+                    found = true;
+                }
+            }
+        }
+        if (!found)
+            break;
+        sort_dist.emplace_back(i_min, j_min);
+        dist[i_min][j_min] = INFINITY;
+    }
+
+    // clear methods until the requested number is left
+    std::vector<int> is_removed(nb_methods, 0);
+    size_t nb_rem_methods = nb_methods;
+
+    while (nb_rem_methods > (size_t) final_nb_methods) {
+        for (auto const & [a, b]: sort_dist) {
+            if (nb_rem_methods <= (size_t) final_nb_methods)
+                break;
+            if (is_removed[a] != 0 || is_removed[b] != 0)
+                continue;
+            auto ratio_of = [](cofactoring_method const & el) {
+                return el.proba[0] < EPSILON_DBL ? 0 : el.time[0] / el.proba[0];
+            };
+            if (ratio_of(tab[a]) > ratio_of(tab[b])) {
+                is_removed[a] = -1;
+                is_removed[b] = 1;
+            } else {
+                is_removed[b] = -1;
+                is_removed[a] = 1;
+            }
+            nb_rem_methods--;
+        }
+        for (auto & x: is_removed)
+            if (x == 1)
+                x = 0;
+    }
+
+    cofactoring_method_list res;
+    for (size_t i = 0; i < nb_methods; i++)
+        if (is_removed[i] != -1)
+            res.push_back(tab[i]);
+
+    sort_by_proba(res);
+
+    return res;
+}
+
+/************************************************************************/
+/*                      CONVEX_HULL_FM                                  */
+/************************************************************************/
+
+/* The factoring methods on the trade-off frontier: those for which no
+ * other method is both more likely to succeed and faster. */
+cofactoring_method_list convex_hull_fm(cofactoring_method_list const & t)
+{
+    return pareto_reduce(t, [](cofactoring_method const & fm) {
+        return std::make_pair(fm.proba[0], fm.time[0]);
+    });
+}

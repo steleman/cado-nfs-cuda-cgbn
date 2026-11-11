@@ -1,0 +1,203 @@
+#include "cado.h" // IWYU pragma: keep
+
+#include <cstdlib>
+#include <cstdio>
+#include <climits>
+
+#include <set>
+
+#include "fmt/base.h"
+
+#include "gzip.h"
+#include "las-duplicate.hpp"
+#include "las-info.hpp"
+#include "las-qlattice.hpp"
+#include "las-siever-config.hpp"
+#include "las-side-config.hpp"
+#include "las-special-markers.hpp"
+#include "special-q.hpp"
+#include "params.hpp"
+#include "relation.hpp"
+#include "sieve-methods.hpp"
+#include "verbose.hpp"
+#include "utils_cxx.hpp"
+#include "cado_main.hpp"
+
+static constexpr bool reprint_special_q_at_each_rel = false;
+
+static void *
+dupsup (FILE *output, relation & rel, special_q const& doing, const int is_dupe)
+{
+  if (reprint_special_q_at_each_rel)
+      fmt::print("# {}\n", doing);
+  rel.print(output, is_dupe ? "# DUPE " : "");
+  return nullptr;
+}
+
+/* FIXME: we should really have static class functions like
+ * las_info::declare_usage
+ *
+ * Well, except that indeed some parameters are used in general by
+ * las_info, and not in this case.
+ */
+static void declare_usage(cxx_param_list & pl)
+{
+  pl.declare_usage("path_antebuffer", "path to antebuffer program");
+  pl.declare_usage("poly", "polynomial file");
+  pl.declare_usage("I",    "set sieving region to 2^I times J");
+  pl.declare_usage("A",    "set sieving region to 2^A");
+  pl.declare_usage("skew", "skewness");
+  pl.declare_usage("dup-qmin", "lower limit of global q-range for 2-sided duplicate removal");
+  pl.declare_usage("dup-qmax", "upper limit of global q-range for 2-sided duplicate removal");
+  pl.declare_usage("dup-qmax-prime", "with -allow-compsq: prime special-q beyond qfac-max were also sieved, from dup-qmin up to this bound (default: none)");
+  pl.declare_usage("dup-qmin-composite", "with -allow-compsq: lower limit of the composite special-q (default: dup-qmin)");
+  pl.declare_usage("sqside", "side of special-q (default=1)");
+  /* those are typical from las invocations, we wish to keep them
+   * accepted */
+  pl.declare_usage("out",  "filename where relations are written, instead of stdout");
+  siever_side_config::declare_usage(pl);
+  pl.declare_usage("fb",   "(unused)");
+  pl.declare_usage("fbc",  "(unused)");
+  pl.declare_usage("q0",   "(unused)");
+  pl.declare_usage("q1",   "(unused)");
+  pl.declare_usage("nq",   "(unused)");
+  pl.declare_usage("v",    "(unused)");
+  verbose_decl_usage(pl);
+  las_info::declare_usage(pl);
+}
+
+// coverity[root_function]
+static int main_ (int argc, char const * argv[]);
+
+int
+main (int argc, char const * argv[])
+{
+    return cado::main_wrapper(main_, argc, argv);
+}
+
+static int main_ (int argc, char const * argv[])
+{
+    cxx_param_list pl;
+    declare_usage(pl);
+
+    pl.configure_switch_old("-v", nullptr);
+
+    pl.process_command_line(argc, argv, true);
+
+    verbose_interpret_parameters(pl);
+    pl.print_command_line(stdout);
+    fflush(stdout);
+
+    if (argc == 0)
+      pl.fail("Error, provide freeform file names\n");
+
+    pl.lookup("fb0");
+    pl.lookup("fb1");
+    pl.lookup("fbc");
+    pl.lookup("q0");
+    pl.lookup("q1");
+    pl.lookup("nq");
+    const char * outputname = pl.lookup_old("out");
+
+    las_info las(pl, NFS{});
+
+    las.prepare_sieve_shared_data(pl);
+
+    if (pl.warn_unused())
+      pl.fail("Unused parameters are given\n");
+
+    FILE * output = stdout;
+    if (outputname) {
+	if (!(output = fopen_maybe_compressed(outputname, "w"))) {
+	    throw cado::error("Could not open {} for writing", outputname);
+	}
+    }
+
+    setvbuf(output, nullptr, _IOLBF, 0);
+
+    special_q doing;
+
+    /* The special-q that las has started and not finished yet. With
+     * several subjobs (-t auto), several of them are active at once, and
+     * the "# Sieving" banners of all of them come before their relations:
+     * the special-q of a relation is then the active one of which (a,b)
+     * is on the lattice. Without these markers (older las output), a
+     * relation belongs to the special-q of the last "# Sieving" banner,
+     * which is only right with a single subjob. */
+    std::set<special_q> active;
+
+    for (int argi = 0; argi < argc; argi++) {
+      FILE *f = fopen_maybe_compressed(argv[argi], "rb");
+      if (f == nullptr) {
+          perror(argv[argi]);
+          abort();
+      }
+      for (; !feof(f) ;) {
+        char line[1024];
+        if (fgets(line, sizeof(line), f) == nullptr)
+          break;
+
+        namespace markers = cado::special_markers;
+        if (auto const begin = markers::begin_special_q::parse(line)) {
+            special_q const & Q = begin->Q;
+            if (las.dupqmin[Q.side] == ULONG_MAX)
+                las.dupqmin[Q.side] = las.config_pool.base.sides[Q.side].lim;
+            active.insert(Q);
+            continue;
+        }
+        if (auto const end = markers::end_special_q::parse(line)) {
+            active.erase(end->Q);
+            continue;
+        }
+
+        if (auto const banner =
+                markers::sieving<qlattice_basis>::parse(line)) {
+            doing = banner->Q.doing;
+            /* If qmin is not given, use lim on the (current) special-q
+             * side by default.  This makes sense only if the relevant
+             * fields have been filled from the command line.
+             *
+             * This is a kludge, really. If we have special-q's on two
+             * sides, the only reliable way to go is to provide both
+             * dup-qmin arguments. The default below kinda makes sense as
+             * a shortcut for the special-q-on-only-one-side setting.
+             *
+             * Note that in particular, this mandates the use of the
+             * -sync argument.
+             */
+            if (las.dupqmin[doing.side] == ULONG_MAX) {
+                las.dupqmin[doing.side] = las.config_pool.base.sides[doing.side].lim;
+                if (las.dupqmin_composite[doing.side] == ULONG_MAX)
+                    las.dupqmin_composite[doing.side] = las.dupqmin[doing.side];
+            }
+
+            continue;
+        }
+
+        relation rel;
+        if (rel.parse(line)) {
+            special_q const * sq = &doing;
+            for (auto const & A : active) {
+                /* special-q are square-free, and their roots are not
+                 * projective: (a,b) is on the lattice of (q,r) iff
+                 * a = r*b mod q */
+                cxx_mpz z;
+                mpz_mul(z, rel.bz, A.r);
+                mpz_sub(z, rel.az, z);
+                if (mpz_divisible_p(z, A.p)) {
+                    sq = &A;
+                    break;
+                }
+            }
+            int const is_dupe = relation_is_duplicate(rel, *sq, las);
+            dupsup(output, rel, *sq, is_dupe);
+        }
+      }
+      fclose_maybe_compressed(f, argv[argi]);
+    }
+    
+    if (outputname)
+        fclose_maybe_compressed(output, outputname);
+
+    return 0;
+}
